@@ -1,8 +1,30 @@
 [build-system]
-requires = ['setuptools>=61.0']
-build-backend = 'setuptools.build_meta'
+requires = ["hatchling"]
+build-backend = "hatchling.build"
 
 [project]
-name = 'scholar-rag-kit'
-version = '0.1.0'
-dependencies = []
+name = "scholar-rag-kit"
+version = "0.1.0"
+description = "Scientific retrieval-augmented generation kit."
+authors = [{ name = "Nexus Scholar Org" }]
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "typer>=0.9.0",
+    "rich>=13.0.0",
+    "chromadb>=0.4.22",
+    "sentence-transformers>=2.3.1",
+    "openai>=1.12.0",
+    "scholar-graph-kit",
+    "scholar-bib-kit",
+]
+
+[project.scripts]
+scholar-rag = "scholar_rag.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/scholar_rag"]
+
+[tool.uv.sources]
+scholar-graph-kit = { path = "../scholar-graph-kit" }
+scholar-bib-kit = { path = "../scholar-bib-kit" }
