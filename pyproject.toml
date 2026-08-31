@@ -5,18 +5,31 @@ build-backend = "hatchling.build"
 [project]
 name = "scholar-rag-kit"
 version = "0.1.0"
-description = "Scientific retrieval-augmented generation kit."
+description = "Scientific retrieval-augmented generation, structural chunking, and graph-boosted synthesis kit."
 authors = [{ name = "Nexus Scholar Org" }]
+license = { text = "MIT" }
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.11"
 dependencies = [
     "typer>=0.9.0",
     "rich>=13.0.0",
     "chromadb>=0.4.22",
     "sentence-transformers>=2.3.1",
     "openai>=1.12.0",
+    "networkx>=3.0",
+    "pydantic>=2.0.0",
+    "bibtexparser>=2.0.0b7",
     "scholar-graph-kit",
     "scholar-bib-kit",
+    "scholar-search-kit",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+    "pytest-cov>=4.0.0",
+    "ruff>=0.1.0",
 ]
 
 [project.scripts]
@@ -28,3 +41,18 @@ packages = ["src/scholar_rag"]
 [tool.uv.sources]
 scholar-graph-kit = { path = "../scholar-graph-kit" }
 scholar-bib-kit = { path = "../scholar-bib-kit" }
+scholar-search-kit = { path = "../scholar-search-kit" }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+ignore = ["E501"]

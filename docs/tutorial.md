@@ -1,45 +1,89 @@
 # Scholar RAG Kit: Tutorial
 
-> [!WARNING]  
-> **Status: Needs Hardening**  
-> This toolkit is an unhardened prototype. It relies on massive local machine learning libraries (`sentence-transformers`, `chromadb`) that may consume significant memory and CPU. The dependency tree is heavy and has not been audited for conflicts.
+This guide walks through using `scholar-rag-kit` for structural chunking, graph-boosted retrieval, and grounded synthesis over extracted academic literature.
 
-This tutorial demonstrates how to perform Retrieval-Augmented Generation (RAG) over the PDFs downloaded by `scholar-pdf-kit`.
+## Prerequisites
 
-## Command Line Interface
-
-### 1. Ingest PDFs
-Point the kit at a directory containing PDFs. It will extract the text, chunk it, embed it using a local SentenceTransformer model, and store it in a local ChromaDB instance.
+Ensure `uv` is installed and the packages in the Nexus Scholar Suite are linked:
 
 ```bash
-scholar-rag ingest --pdf-dir ../scholar-pdf-kit/downloads
+cd tools/scholar-rag-kit
+uv sync --extra dev
 ```
 
-### 2. Chat with the Literature
-Start an interactive chat loop with your ingested literature. You can configure which LLM backend `litellm` routes to via environment variables (e.g. `OPENAI_API_KEY`).
+---
+
+## 1. Indexing Extracted Markdown Documents
+
+`scholar-rag-kit` processes structured Markdown documents extracted from full-text PDFs (via `scholar-pdf-kit` / Docling or Grobid).
 
 ```bash
-scholar-rag chat --model gpt-4o
+# Index a directory of extracted markdown files
+uv run scholar-rag index workspaces/multispectral-weeds/extracted/ \
+  --bib workspaces/multispectral-weeds/literature/references.bib \
+  --workspace-id multispectral-weeds
 ```
-*Example Interaction:*
-> **User**: How did the authors handle sample contamination in the CRISPR paper?  
-> **Bot**: Based on the retrieved context (10.1234_crispr.pdf), the authors used a double-blinded wash process...
 
-## Python API
+### What happens during indexing?
+1. **AST Structural Splitting**: `MarkdownChunker` analyzes heading tags (`#`, `##`, `###`), extracting hierarchy paths (`Introduction > Background`).
+2. **Section Categorization**: Headings are automatically classified into canonical categories: `abstract_intro`, `methodology`, `results_empirical`, `discussion_limitations`.
+3. **Deterministic ID Generation**: Each chunk is assigned an immutable ID (e.g. `chk-000412-methods-01`).
+4. **Idempotent Upsert**: Vectors and flattened metadata are written into ChromaDB via `collection.upsert()`. Re-running does not produce duplicate chunks.
+5. **Provenance Journaling**: An event `RAG_INDEX_BUILT` is logged to `audit/journal.jsonl`.
 
-You can script custom QA pipelines:
+---
 
-```python
-from scholar_rag.vectorstore import VectorStore
-from scholar_rag.engine import RAGEngine
-from scholar_rag.processor import DocumentProcessor
+## 2. Targeted Semantic Querying & Slicing
 
-# 1. Ingest
-chunks = DocumentProcessor().extract_chunks("paper.pdf")
-store = VectorStore(persist_directory="./db")
-store.add_documents(chunks)
+You can filter queries by section category, paradigm, or study design:
 
-# 2. Query
-engine = RAGEngine(vector_store=store, model="gpt-4o-mini")
-print(engine.chat("What are the limitations of this study?"))
+```bash
+# Query only methodology sections
+uv run scholar-rag query "spectral band selection and calibration" \
+  --section-category methodology \
+  --limit 3
+```
+
+### Hybrid Citation Graph Boosting
+
+To prioritize seminal or highly-central literature without losing semantic relevance, supply a citation graph from `scholar-graph-kit`:
+
+```bash
+uv run scholar-rag query "deep learning vegetation index segmentation" \
+  --graph workspaces/multispectral-weeds/literature/graph.json \
+  --boost-doi 10.1016/j.compag.2023.107890 \
+  --alpha 0.3 --beta 0.15
+```
+
+Formula:
+$$\text{Score}(d) = \text{CosineSim}(q, d) + \alpha \cdot \text{PageRank}(d) + \beta \cdot \mathbb{I}_{\text{seed}}(d)$$
+
+---
+
+## 3. Grounded Synthesis with Atomic Citation Tokens
+
+Run synthesis against a specific research question to generate literature review text where every empirical claim is tagged with an atomic token `[WORKSPACE_ID#SECTION#CHUNK_ID]`:
+
+```bash
+uv run scholar-rag synthesize "What CNN architectures achieve highest mIoU on multispectral weed datasets?" \
+  --rq-id RQ1 \
+  --output workspaces/multispectral-weeds/synthesis/literature_review.md
+```
+
+### Entailment Verification
+The synthesis engine automatically checks whether generated claims are supported by the retrieved evidence chunks, reporting:
+- `VERIFIED` ($\ge 0.85$ semantic alignment)
+- `AMBIGUOUS` ($0.50 - 0.84$)
+- `UNSUPPORTED` ($< 0.50$)
+
+---
+
+## 4. Cross-Study Methodology Comparison Matrix
+
+Generate a 7-dimension comparison matrix across all indexed papers in the workspace:
+
+```bash
+uv run scholar-rag matrix \
+  --output-md workspaces/multispectral-weeds/synthesis/matrix.md \
+  --output-json workspaces/multispectral-weeds/synthesis/matrix.json
 ```
