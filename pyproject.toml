@@ -39,9 +39,10 @@ scholar-rag = "scholar_rag.cli:app"
 packages = ["src/scholar_rag"]
 
 [tool.uv.sources]
-scholar-graph-kit = { path = "../scholar-graph-kit" }
-scholar-bib-kit = { path = "../scholar-bib-kit" }
-scholar-search-kit = { path = "../scholar-search-kit" }
+scholar-protocol-kit = { path = "../scholar-protocol-kit", editable = true }
+scholar-graph-kit = { path = "../scholar-graph-kit", editable = true }
+scholar-bib-kit = { path = "../scholar-bib-kit", editable = true }
+scholar-search-kit = { path = "../scholar-search-kit", editable = true }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
