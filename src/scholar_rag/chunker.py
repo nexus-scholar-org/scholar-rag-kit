@@ -229,6 +229,10 @@ class MarkdownChunker:
                         declared_limitations=merged_meta.get("declared_limitations"),
                     )
 
+                authors_val = merged_meta.get("authors")
+                if isinstance(authors_val, list):
+                    authors_val = ", ".join(str(a) for a in authors_val)
+
                 meta = ChunkMetadata(
                     chunk_id=chunk_id,
                     workspace_id=merged_meta.get("workspace_id"),
@@ -236,9 +240,9 @@ class MarkdownChunker:
                     doi=merged_meta.get("doi"),
                     filename=merged_meta.get("filename", ""),
                     title=merged_meta.get("title"),
-                    authors=merged_meta.get("authors"),
+                    authors=authors_val,
                     year=int(merged_meta["year"])
-                    if "year" in merged_meta and str(merged_meta["year"]).isdigit()
+                    if merged_meta.get("year") and str(merged_meta["year"]).isdigit()
                     else None,
                     section=sec_title,
                     section_hierarchy=hierarchy,
