@@ -19,8 +19,16 @@ class MockEmbeddingFunction(embedding_functions.EmbeddingFunction):
     def __init__(self, dim: int = 384):
         self.dim = dim
 
-    def name(self) -> str:
+    @staticmethod
+    def name() -> str:
         return "mock"
+
+    def get_config(self) -> dict[str, Any]:
+        return {"dim": self.dim}
+
+    @classmethod
+    def build_from_config(cls, config: dict[str, Any]) -> MockEmbeddingFunction:
+        return cls(dim=config.get("dim", 384))
 
     def __call__(self, input: Any) -> list[list[float]]:
         texts = input if isinstance(input, list) else [input]

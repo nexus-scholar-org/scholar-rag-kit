@@ -167,15 +167,21 @@ class GroundedSynthesisEngine:
         return claims
 
     def _find_workspace_audit_journal(self) -> Path | None:
-        """Locates audit journal in current or parent directories."""
-        curr = Path(".").resolve()
-        for _ in range(5):
-            cand = curr / "audit" / "journal.jsonl"
-            if cand.exists():
-                return cand
-            if curr.parent == curr:
-                break
-            curr = curr.parent
+        """Locates audit journal in current, db_path, or parent directories."""
+        search_roots = [
+            Path(".").resolve(),
+            Path(getattr(self.retriever, "db_path", ".")).resolve(),
+        ]
+        for root in search_roots:
+            curr = root
+            for _ in range(5):
+                cand = curr / "audit" / "journal.jsonl"
+                if cand.exists() or (curr / "audit").exists() or (curr / "protocol.json").exists() or (curr / "project.json").exists():
+                    (curr / "audit").mkdir(parents=True, exist_ok=True)
+                    return curr / "audit" / "journal.jsonl"
+                if curr.parent == curr:
+                    break
+                curr = curr.parent
         return None
 
     def _log_synthesis_event(self, rq_id: str | None, chunks_count: int, claims_count: int, verified_count: int):

@@ -37,13 +37,23 @@ class MarkdownChunker:
 
     @staticmethod
     def _parse_frontmatter(markdown_text: str) -> tuple[dict[str, Any], str]:
-        """Extracts YAML-like frontmatter if present at the start of markdown."""
+        """Extracts YAML frontmatter if present at the start of markdown."""
         frontmatter: dict[str, Any] = {}
         if markdown_text.startswith("---"):
             parts = markdown_text.split("---", 2)
             if len(parts) >= 3:
                 raw_fm = parts[1]
                 body = parts[2]
+                try:
+                    import yaml
+
+                    parsed = yaml.safe_load(raw_fm)
+                    if isinstance(parsed, dict):
+                        frontmatter = {str(k).lower(): v for k, v in parsed.items()}
+                        return frontmatter, body
+                except Exception:
+                    pass
+
                 for line in raw_fm.strip().split("\n"):
                     if ":" in line:
                         k, v = line.split(":", 1)
@@ -242,3 +252,5 @@ class MarkdownChunker:
                 global_chunk_idx += 1
 
         return chunks
+
+    chunk_markdown = chunk

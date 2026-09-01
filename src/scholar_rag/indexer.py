@@ -125,7 +125,7 @@ class ScholarIndexer:
         curr = start_dir.resolve()
         for _ in range(5):
             candidate = curr / "audit" / "journal.jsonl"
-            if candidate.exists() or (curr / "project.json").exists():
+            if candidate.exists() or (curr / "audit").exists() or (curr / "protocol.json").exists() or (curr / "project.json").exists():
                 (curr / "audit").mkdir(parents=True, exist_ok=True)
                 return curr / "audit" / "journal.jsonl"
             if curr.parent == curr:

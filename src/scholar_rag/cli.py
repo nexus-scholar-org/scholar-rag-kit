@@ -248,12 +248,31 @@ def synthesize(
 
 @app.command("matrix")
 def matrix(
+    protocol: Path | None = typer.Option(
+        None, "--protocol", "-P", help="Path to protocol.json containing matrix_dimensions"
+    ),
     db_path: str = typer.Option("./chroma_db", help="Path to ChromaDB vector store"),
     collection: str = typer.Option("scholar_docs", help="Collection name"),
-    output_md: Path | None = typer.Option(Path("matrix.md"), "--output-md", help="Path to save markdown matrix"),
-    output_json: Path | None = typer.Option(Path("matrix.json"), "--output-json", help="Path to save JSON matrix"),
+    output_dir: Path = typer.Option(Path("literature"), "--output-dir", "-o", help="Output directory to save matrices"),
+    output_md: Path | None = typer.Option(None, "--output-md", help="Explicit path to save markdown matrix"),
+    output_json: Path | None = typer.Option(None, "--output-json", help="Explicit path to save JSON matrix"),
 ):
-    """Generate 7-dimension Cross-Study Methodology Comparison Matrix across all indexed papers."""
+    """Generate dynamic Protocol Extraction Matrix or 7-dimension Methodology Comparison Matrix."""
+    if protocol and protocol.exists():
+        from scholar_rag.matrix import MatrixExtractor
+
+        console.print(f"[bold cyan]Extracting protocol matrix for {protocol.name}...[/bold cyan]")
+        extractor = MatrixExtractor(protocol=protocol, db_path=db_path, collection_name=collection)
+        rows, csv_path, json_path = extractor.extract_all(output_dir=output_dir)
+
+        console.print(f"[bold green]Matrix extraction complete![/bold green]")
+        console.print(f"  Extracted Studies: {len(rows)}")
+        console.print(f"  CSV Matrix: {csv_path}")
+        console.print(f"  JSON Matrix: {json_path}")
+        console.print(f"  Markdown Matrix: {output_dir / 'synthesis_matrix.md'}")
+        return
+
+    # Fallback to standard 7-dimension methodology matrix
     indexer = ScholarIndexer(db_path=db_path, collection_name=collection, embedder_kwargs={"provider": "mock"})
     rows, md_table = generate_methodology_matrix(indexer=indexer)
 
@@ -263,14 +282,16 @@ def matrix(
 
     console.print(Panel(md_table, title="Cross-Study Methodology Comparison Matrix"))
 
-    if output_md:
-        output_md.write_text(md_table, encoding="utf-8")
-        console.print(f"[bold green]Saved matrix markdown to {output_md}[/bold green]")
+    target_md = output_md or (output_dir / "matrix.md")
+    target_json = output_json or (output_dir / "matrix.json")
+    target_md.parent.mkdir(parents=True, exist_ok=True)
 
-    if output_json:
-        data = [r.model_dump() for r in rows]
-        output_json.write_text(json.dumps(data, indent=2), encoding="utf-8")
-        console.print(f"[bold green]Saved matrix JSON to {output_json}[/bold green]")
+    target_md.write_text(md_table, encoding="utf-8")
+    console.print(f"[bold green]Saved matrix markdown to {target_md}[/bold green]")
+
+    data = [r.model_dump() for r in rows]
+    target_json.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    console.print(f"[bold green]Saved matrix JSON to {target_json}[/bold green]")
 
 
 @app.command("stats")

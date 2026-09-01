@@ -14,6 +14,7 @@ from scholar_rag.models import (
     SynthesisResult,
     classify_section,
 )
+from scholar_rag.matrix import MatrixExtractor
 from scholar_rag.retriever import ScholarRetriever
 from scholar_rag.synthesis import GroundedSynthesisEngine, generate_methodology_matrix
 
@@ -24,6 +25,7 @@ __all__ = [
     "ChunkMetadata",
     "GroundedSynthesisEngine",
     "MarkdownChunker",
+    "MatrixExtractor",
     "MethodologyMatrixRow",
     "MethodologyMetadata",
     "RetrievalResult",

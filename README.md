@@ -83,12 +83,17 @@ uv run scholar-rag synthesize "How does structural chunking impact hallucination
   --output workspaces/my-project/synthesis/literature_review.md
 ```
 
-### 4. Export Methodology Comparison Matrix
+### 4. Dynamic Protocol Extraction Matrix
 ```bash
-# Generate 7-dimension comparison matrix across all indexed papers
+# Extract dynamic dimensions defined in protocol.json
 uv run scholar-rag matrix \
-  --output-md workspaces/my-project/synthesis/matrix.md \
-  --output-json workspaces/my-project/synthesis/matrix.json
+  --protocol workspaces/my-project/protocol.json \
+  --output-dir workspaces/my-project/literature/
+
+# Or generate 7-dimension comparison matrix across all indexed papers
+uv run scholar-rag matrix \
+  --output-md workspaces/my-project/literature/matrix.md \
+  --output-json workspaces/my-project/literature/matrix.json
 ```
 
 ---
