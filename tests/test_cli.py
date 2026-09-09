@@ -1,10 +1,17 @@
 """Unit tests for scholar-rag CLI commands."""
 
+import re
+
 from typer.testing import CliRunner
 
 from scholar_rag.cli import app
 
 runner = CliRunner()
+
+
+def _plain(output: str) -> str:
+    """Strip ANSI SGR/CSI codes (rich colorizes per-word on some Windows setups)."""
+    return re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", output)
 
 
 def test_cli_index_and_query_flow(tmp_path):
@@ -33,7 +40,7 @@ Reasoning accuracy increased by 22%.
         app, ["index", str(docs_dir), "--db-path", str(db_dir), "--embedder", "mock", "--no-journal"]
     )
     assert index_res.exit_code == 0
-    assert "Indexed 1 files" in index_res.output or "Successfully indexed" in index_res.output
+    assert "Indexed 1 files" in _plain(index_res.output) or "Successfully indexed" in _plain(index_res.output)
 
     # 2. Query command
     query_res = runner.invoke(

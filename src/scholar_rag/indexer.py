@@ -39,9 +39,15 @@ class ScholarIndexer:
         # Initialize ChromaDB persistent client
         os.makedirs(db_path, exist_ok=True)
         self.client = chromadb.PersistentClient(path=db_path)
-        self.collection = self.client.get_or_create_collection(
-            name=collection_name, embedding_function=self.embedder, metadata={"hnsw:space": "cosine"}
-        )
+        try:
+            self.collection = self.client.get_or_create_collection(
+                name=collection_name, embedding_function=self.embedder, metadata={"hnsw:space": "cosine"}
+            )
+        except ValueError as e:
+            if "Embedding function conflict" in str(e) or "already exists" in str(e):
+                self.collection = self.client.get_collection(name=collection_name)
+            else:
+                raise
 
     def index_markdown(
         self,

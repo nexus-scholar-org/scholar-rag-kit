@@ -10,6 +10,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from scholar_rag.consensus import classify_stance
 from scholar_rag.models import (
     MethodologyMatrixRow,
     RetrievalResult,
@@ -17,6 +18,45 @@ from scholar_rag.models import (
     SynthesisResult,
 )
 from scholar_rag.retriever import ScholarRetriever
+
+
+def _clean_snippet(text: str, max_chars: int = 160) -> str:
+    """Reduces raw chunk text to a clean, factual claim fragment.
+
+    Strips markdown emphasis/heading artifacts, trailing citation tokens, and
+    truncates at a sentence or word boundary so downstream claim extraction
+    yields crisp cited assertions instead of long token-glued dumps.
+    """
+    first_line = (text or "").split("\n", 1)[0].strip()
+    first_line = re.sub(r"\*\*+|`+|#{1,6}\s*", " ", first_line)
+    first_line = re.sub(r"\s+", " ", first_line).strip()
+    first_line = re.sub(r"\s*\[[^\]]+\]\s*$", "", first_line).strip()
+    if not first_line:
+        return ""
+    if len(first_line) <= max_chars:
+        return first_line
+    cut = first_line[:max_chars]
+    best = None
+    for m in re.finditer(r"[.!?]", cut):
+        if m.start() >= max_chars - 40:
+            best = m.end()
+    if best:
+        return first_line[:best]
+    if " " in cut:
+        return cut.rsplit(" ", 1)[0] + "\u2026"
+    return cut
+
+
+def _claim_units(markdown_text: str) -> list[str]:
+    """Breaks generated synthesis markdown into claim units (one per bullet).
+
+    Prefers ``- `` bullet lines (the deterministic generator emits one per
+    cited chunk); falls back to sentence splitting for free-form LLM output.
+    """
+    bullets = [ln[2:].strip() for ln in markdown_text.splitlines() if ln.strip().startswith("- ")]
+    if bullets:
+        return [b for b in bullets if b]
+    return [s for s in re.split(r"(?<=[.!?])\s+", markdown_text.strip()) if s]
 
 
 class GroundedSynthesisEngine:
@@ -127,13 +167,12 @@ class GroundedSynthesisEngine:
         token_to_chunk = {c.citation_token: c for c in retrieved_chunks if c.citation_token}
         id_to_chunk = {c.chunk_id: c for c in retrieved_chunks}
 
-        sentences = re.split(r"(?<=[.!?])\s+", markdown_text.strip())
         claims: list[SynthesisClaim] = []
 
         token_pattern = re.compile(r"\[([^\]]+#[^\]]+#[^\]]+)\]")
 
-        for sent in sentences:
-            found_tokens = token_pattern.findall(sent)
+        for unit in _claim_units(markdown_text):
+            found_tokens = token_pattern.findall(unit)
             if not found_tokens:
                 continue
 
@@ -148,19 +187,38 @@ class GroundedSynthesisEngine:
                     supporting_ids.append(chunk.chunk_id)
                 else:
                     # Match by chunk ID inside token
-                    for cid, c in id_to_chunk.items():
+                    for cid, ch in id_to_chunk.items():
                         if cid in token:
-                            supporting_texts.append(c.text)
+                            supporting_texts.append(ch.text)
                             supporting_ids.append(cid)
 
-            score, status = self.verify_claim_entailment(sent, supporting_texts)
+            score, status = self.verify_claim_entailment(unit, supporting_texts)
+
+            study_ids = []
+            for cid in supporting_ids:
+                chunk = id_to_chunk.get(cid)
+                if not chunk:
+                    continue
+                meta = chunk.metadata or {}
+                study = meta.get("workspace_id") or meta.get("paper_id") or meta.get("filename")
+                if study:
+                    study_ids.append(str(study))
+            study_id = study_ids[0] if study_ids else "UNKNOWN"
+
+            clean_text = token_pattern.sub("", unit)
+            clean_text = re.sub(r"\s+", " ", clean_text).strip()
+            if len(clean_text) > 220:
+                clean_text = _clean_snippet(clean_text, max_chars=220)
+
             claims.append(
                 SynthesisClaim(
-                    claim_text=sent.strip(),
+                    claim_text=clean_text,
                     citation_tokens=full_tokens,
                     entailment_score=score,
                     entailment_status=status,
                     supporting_chunk_ids=supporting_ids,
+                    study_id=study_id,
+                    stance=classify_stance(clean_text),
                 )
             )
 
@@ -250,11 +308,9 @@ class GroundedSynthesisEngine:
             # Deterministic grounded synthesis generator
             lines = [f"### Synthesis for: {query}\n"]
             for c in retrieved_chunks:
-                clean_snippet = c.text.split("\n")[0].strip()
-                if clean_snippet:
-                    lines.append(
-                        f"- Based on empirical findings in {c.metadata.get('section', 'the literature')}, {clean_snippet.lower()} {c.citation_token}"
-                    )
+                snippet = _clean_snippet(c.text)
+                if snippet:
+                    lines.append(f"- {snippet} {c.citation_token}")
             generated_text = "\n".join(lines)
 
         claims = self._extract_claims_and_citations(generated_text, retrieved_chunks)

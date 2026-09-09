@@ -38,6 +38,11 @@ class ScholarRetriever:
         self.client = chromadb.PersistentClient(path=db_path)
         try:
             self.collection = self.client.get_collection(name=collection_name, embedding_function=self.embedder)
+        except ValueError as e:
+            if "Embedding function conflict" in str(e) or "already exists" in str(e):
+                self.collection = self.client.get_collection(name=collection_name)
+            else:
+                raise
         except Exception:
             self.collection = self.client.get_or_create_collection(
                 name=collection_name, embedding_function=self.embedder, metadata={"hnsw:space": "cosine"}

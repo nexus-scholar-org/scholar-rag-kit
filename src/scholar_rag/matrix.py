@@ -123,21 +123,27 @@ class MatrixExtractor:
         # For each dimension in protocol.matrix_dimensions:
         for dim in self.dimensions:
             target_category = dim.target_section_category
+            doi = study_id if "/" in study_id or "." in study_id else None
+            ws_id = study_id if not doi else None
 
-            # Query relevant chunks for this dimension
+            # Query relevant chunks for this dimension, scoped to the study's workspace_id or DOI
             relevant_chunks = self.retriever.query(
                 query_text=f"{dim.name} {dim.description}",
                 n_results=3,
-                workspace_id=study_id if study_id.startswith("SCI-") else None,
+                doi=doi,
+                workspace_id=ws_id,
                 section_category=target_category if target_category else None,
                 log_journal=False,
             )
 
-            # If no chunks filtered by workspace_id, try without workspace_id filter
+            # NOTE: do NOT fall back to global retrieval here, as that would
+            # inject another paper's content into this study's matrix cell.
             if not relevant_chunks:
                 relevant_chunks = self.retriever.query(
                     query_text=f"{dim.name} {dim.description}",
                     n_results=3,
+                    doi=doi,
+                    workspace_id=ws_id,
                     section_category=target_category if target_category else None,
                     log_journal=False,
                 )

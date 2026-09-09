@@ -3,14 +3,23 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
+
+if sys.platform == "win32":
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 import typer
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
+from scholar_rag.consensus import ConsensusCartographer
 from scholar_rag.indexer import ScholarIndexer
+from scholar_rag.models import SynthesisClaim
 from scholar_rag.retriever import ScholarRetriever
 from scholar_rag.synthesis import GroundedSynthesisEngine, generate_methodology_matrix
 
@@ -18,7 +27,7 @@ app = typer.Typer(
     help="Scholar RAG Kit: Structural chunking, hybrid graph-boosted retrieval, and grounded synthesis for scientific literature.",
     no_args_is_help=True,
 )
-console = Console()
+console = Console(force_terminal=True, legacy_windows=False)
 
 
 @app.command("index")
@@ -184,6 +193,9 @@ def synthesize(
     output_file: Path | None = typer.Option(
         None, "--output", "-o", help="File to write synthesized literature review markdown"
     ),
+    output_claims: Path | None = typer.Option(
+        None, "--output-claims", help="File to write the verified claim ledger (JSON) for consensus analysis"
+    ),
     db_path: str = typer.Option("./chroma_db", help="Path to ChromaDB persistent vector database"),
     collection: str = typer.Option("scholar_docs", help="Collection name"),
     embedder: str = typer.Option(
@@ -196,7 +208,9 @@ def synthesize(
     limit: int = typer.Option(5, "--limit", "-n", help="Number of evidence chunks to retrieve"),
 ):
     """Generate grounded synthesis with atomic citation tokens and automated entailment verification."""
-    engine = GroundedSynthesisEngine(db_path=db_path, embedder_kwargs={"provider": embedder})
+    engine = GroundedSynthesisEngine(
+        db_path=db_path, collection_name=collection, embedder_kwargs={"provider": embedder}
+    )
 
     with console.status("[cyan]Synthesizing findings & verifying claim entailment...[/cyan]"):
         result = engine.synthesize(
@@ -245,6 +259,116 @@ def synthesize(
         output_file.write_text(result.synthesis_markdown, encoding="utf-8")
         console.print(f"\n[bold green]Saved synthesis to {output_file}[/bold green]")
 
+    if output_claims:
+        output_claims.parent.mkdir(parents=True, exist_ok=True)
+        claims_data = [c.model_dump() for c in result.claims]
+        output_claims.write_text(json.dumps(claims_data, indent=2, ensure_ascii=False), encoding="utf-8")
+        console.print(f"[bold green]Saved {len(claims_data)} claims to {output_claims}[/bold green]")
+
+
+@app.command("consensus")
+def consensus(
+    claims_file: Path = typer.Argument(
+        ..., help="JSON/JSONL file of SynthesisClaim records (from scholar-rag synthesize --output-claims)"
+    ),
+    rq_id: str | None = typer.Option(None, "--rq-id", "-r", help="Research question identifier for the report"),
+    threshold: float = typer.Option(
+        ConsensusCartographer.DEFAULT_THRESHOLD,
+        "--threshold",
+        "-t",
+        help="Min claim similarity for clustering (0..1)",
+    ),
+    similarity: str = typer.Option(
+        "lexical",
+        "--similarity",
+        help="Claim similarity: 'lexical' (Jaccard) or 'sentence-transformers' (embedding cosine)",
+    ),
+    model_name: str | None = typer.Option(
+        None, "--model-name", help="Embedding model for semantic similarity (e.g. all-MiniLM-L6-v2)"
+    ),
+    output_json: Path | None = typer.Option(None, "--output-json", help="File to write the full report (JSON)"),
+    output_md: Path | None = typer.Option(None, "--output-md", help="File to write the markdown report"),
+):
+    """Group claims into high-consensus findings vs. active debates (Consensus Cartographer)."""
+    if not claims_file.exists():
+        console.print(f"[bold red]Error:[/bold red] Claims file {claims_file} does not exist.")
+        raise typer.Exit(1)
+
+    raw_records: list[dict] = []
+    if claims_file.suffix.lower() == ".jsonl":
+        for line in claims_file.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line:
+                raw_records.append(json.loads(line))
+    else:
+        data = json.loads(claims_file.read_text(encoding="utf-8"))
+        raw_records = data if isinstance(data, list) else [data]
+
+    claims = [SynthesisClaim(**{k: v for k, v in r.items() if k in SynthesisClaim.model_fields}) for r in raw_records]
+
+    if not claims:
+        console.print("[yellow]No claims found in input file.[/yellow]")
+        raise typer.Exit(1)
+
+    similarity_fn = None
+    if similarity != "lexical":
+        try:
+            from scholar_rag.consensus import embedder_claim_scorer
+            from scholar_rag.embedder import get_embedder
+
+            embedder = get_embedder(provider=similarity, model_name=model_name)
+            similarity_fn = embedder_claim_scorer(embedder)
+        except Exception as exc:
+            console.print(f"[bold yellow]Warning:[/bold yellow] {similarity} scorer unavailable ({exc}); using lexical Jaccard.")
+            similarity_fn = None
+
+    cartographer = ConsensusCartographer(similarity_fn=similarity_fn)
+    report = cartographer.analyze(claims=claims, rq_id=rq_id, threshold=threshold)
+
+    console.print(
+        Panel(
+            f"[bold cyan]RQ:[/bold cyan] {rq_id or 'General'}\n"
+            f"[bold]Input Claims:[/bold] {report.input_claims} | "
+            f"[bold]Clusters:[/bold] {report.total_groups} | "
+            f"[bold green]High-Consensus:[/bold green] {len(report.high_consensus)} | "
+            f"[bold yellow]Active Debates:[/bold yellow] {len(report.active_debates)} | "
+            f"[bold dim]Unresolved:[/bold dim] {len(report.unresolved)} | "
+            f"[bold white]Provisional:[/bold white] {len(report.provisional)}",
+            title="Consensus Cartographer Report",
+        )
+    )
+
+    for bucket_title, bucket in (
+        ("High-Consensus Findings", report.high_consensus),
+        ("Active Debates", report.active_debates),
+    ):
+        if not bucket:
+            continue
+        console.print(f"\n[bold]{bucket_title}:[/bold]")
+        table = Table()
+        table.add_column("Cluster", style="bold")
+        table.add_column("Consensus", style="cyan")
+        table.add_column("Studies", justify="right")
+        table.add_column("Theme", style="white", max_width=80)
+        for g in bucket:
+            table.add_row(
+                g.cluster_id,
+                f"{g.consensus_score:.2f}",
+                str(len(g.supporting_studies)),
+                g.theme[:80] + ("..." if len(g.theme) > 80 else ""),
+            )
+        console.print(table)
+
+    if output_json:
+        output_json.parent.mkdir(parents=True, exist_ok=True)
+        output_json.write_text(json.dumps(report.model_dump(), indent=2, ensure_ascii=False), encoding="utf-8")
+        console.print(f"[bold green]Saved consensus report to {output_json}[/bold green]")
+
+    if output_md:
+        output_md.parent.mkdir(parents=True, exist_ok=True)
+        output_md.write_text(report.rendered_markdown, encoding="utf-8")
+        console.print(f"[bold green]Saved consensus markdown to {output_md}[/bold green]")
+
 
 @app.command("matrix")
 def matrix(
@@ -256,13 +380,18 @@ def matrix(
     output_dir: Path = typer.Option(Path("literature"), "--output-dir", "-o", help="Output directory to save matrices"),
     output_md: Path | None = typer.Option(None, "--output-md", help="Explicit path to save markdown matrix"),
     output_json: Path | None = typer.Option(None, "--output-json", help="Explicit path to save JSON matrix"),
+    embedder: str = typer.Option(
+        "sentence-transformers", "--embedder", "-e", help="Embedder provider: mock or sentence-transformers"
+    ),
 ):
     """Generate dynamic Protocol Extraction Matrix or 7-dimension Methodology Comparison Matrix."""
     if protocol and protocol.exists():
         from scholar_rag.matrix import MatrixExtractor
 
         console.print(f"[bold cyan]Extracting protocol matrix for {protocol.name}...[/bold cyan]")
-        extractor = MatrixExtractor(protocol=protocol, db_path=db_path, collection_name=collection)
+        extractor = MatrixExtractor(
+            protocol=protocol, db_path=db_path, collection_name=collection, embedder_kwargs={"provider": embedder}
+        )
         rows, csv_path, json_path = extractor.extract_all(output_dir=output_dir)
 
         console.print(f"[bold green]Matrix extraction complete![/bold green]")
@@ -273,7 +402,7 @@ def matrix(
         return
 
     # Fallback to standard 7-dimension methodology matrix
-    indexer = ScholarIndexer(db_path=db_path, collection_name=collection, embedder_kwargs={"provider": "mock"})
+    indexer = ScholarIndexer(db_path=db_path, collection_name=collection, embedder_kwargs={"provider": embedder})
     rows, md_table = generate_methodology_matrix(indexer=indexer)
 
     if not rows:
@@ -298,9 +427,12 @@ def matrix(
 def stats(
     db_path: str = typer.Option("./chroma_db", help="Path to ChromaDB vector store"),
     collection: str = typer.Option("scholar_docs", help="Collection name"),
+    embedder: str = typer.Option(
+        "sentence-transformers", "--embedder", "-e", help="Embedder provider: mock or sentence-transformers"
+    ),
 ):
     """Display vector database summary statistics and section distribution."""
-    indexer = ScholarIndexer(db_path=db_path, collection_name=collection, embedder_kwargs={"provider": "mock"})
+    indexer = ScholarIndexer(db_path=db_path, collection_name=collection, embedder_kwargs={"provider": embedder})
     count = indexer.get_collection_count()
     console.print(f"[bold cyan]Database Path:[/bold cyan] {db_path}")
     console.print(f"[bold cyan]Collection Name:[/bold cyan] {collection}")

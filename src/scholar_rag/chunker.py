@@ -144,6 +144,11 @@ class MarkdownChunker:
 
         fm_meta, body = self._parse_frontmatter(markdown_text)
         merged_meta = {**base_metadata, **fm_meta}
+        # Canonical provenance fields from companion metadata (e.g. BibTeX) take
+        # precedence over a document's own (sometimes placeholder) frontmatter
+        for _k in ("title", "authors", "year", "doi", "paradigm", "study_design"):
+            if base_metadata.get(_k):
+                merged_meta[_k] = base_metadata[_k]
 
         # Resolve document identifier
         resolved_doc_id = (

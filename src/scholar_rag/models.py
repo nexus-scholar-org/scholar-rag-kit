@@ -198,6 +198,8 @@ class SynthesisClaim(BaseModel):
     entailment_score: float = 0.0
     entailment_status: str = "UNSUPPORTED"  # VERIFIED (>=0.85), AMBIGUOUS (0.50-0.84), UNSUPPORTED (<0.50)
     supporting_chunk_ids: list[str] = Field(default_factory=list)
+    study_id: str | None = None  # Source study attribution (workspace/paper id/filename)
+    stance: str = "neutral"  # POSITIVE / NEGATIVE / NEUTRAL claim stance relative to its theme
 
 
 class SynthesisResult(BaseModel):
@@ -222,3 +224,46 @@ class MethodologyMatrixRow(BaseModel):
     key_intervention_model: str
     primary_metrics_results: str
     declared_limitations: str
+
+
+class ClaimStance(str, Enum):
+    """Stance polarity of a scientific claim relative to its thematic cluster."""
+
+    POSITIVE = "POSITIVE"
+    NEGATIVE = "NEGATIVE"
+    NEUTRAL = "NEUTRAL"
+
+
+class ConsensusVerdict(str, Enum):
+    """Verdict bucket for an evidence cluster in the Consensus Cartographer."""
+
+    HIGH_CONSENSUS = "HIGH_CONSENSUS"
+    ACTIVE_DEBATE = "ACTIVE_DEBATE"
+    UNRESOLVED = "UNRESOLVED"
+    PROVISIONAL = "PROVISIONAL"
+
+
+class ClaimGroup(BaseModel):
+    """An evidence cluster of semantically similar claims across studies."""
+
+    cluster_id: str
+    theme: str  # Representative (highest-entailment, tie-broken by brevity) claim text
+    claims: list[SynthesisClaim] = Field(default_factory=list)
+    supporting_studies: list[str] = Field(default_factory=list)
+    stance_distribution: dict[str, int] = Field(default_factory=dict)  # study-majority stance counts
+    consensus_score: float = 0.0  # agreed / (agreed + opposing) over contested studies
+    verdict: str = ConsensusVerdict.PROVISIONAL.value
+
+
+class ConsensusReport(BaseModel):
+    """Outcome of consensus clustering over a set of claims."""
+
+    rq_id: str | None = None
+    input_claims: int = 0
+    total_groups: int = 0
+    threshold: float = 0.0
+    high_consensus: list[ClaimGroup] = Field(default_factory=list)
+    active_debates: list[ClaimGroup] = Field(default_factory=list)
+    unresolved: list[ClaimGroup] = Field(default_factory=list)
+    provisional: list[ClaimGroup] = Field(default_factory=list)
+    rendered_markdown: str = ""
