@@ -9,8 +9,6 @@ import re
 from pathlib import Path
 from typing import Any
 
-import chromadb
-
 from scholar_rag.chunker import MarkdownChunker
 from scholar_rag.embedder import get_embedder
 from scholar_rag.models import Chunk
@@ -38,6 +36,8 @@ class ScholarIndexer:
 
         # Initialize ChromaDB persistent client
         os.makedirs(db_path, exist_ok=True)
+        import chromadb  # deferred: keeps `import scholar_rag.indexer` chromadb-free
+
         self.client = chromadb.PersistentClient(path=db_path)
         try:
             self.collection = self.client.get_or_create_collection(

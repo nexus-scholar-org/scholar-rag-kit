@@ -7,13 +7,18 @@ import math
 import os
 from typing import Any
 
-from chromadb.utils import embedding_functions
 
-
-class MockEmbeddingFunction(embedding_functions.EmbeddingFunction):
+class MockEmbeddingFunction:
     """
     Deterministic, fast mock embedding function for hermetic unit testing and CI
     without requiring heavy PyTorch or network downloads. Generates normalized 384-dim vectors.
+
+    Implemented as a standalone duck-typed class matching ChromaDB's ``EmbeddingFunction``
+    protocol (``name()``, ``get_config()``, ``build_from_config()``, ``__call__``) so that
+    importing this module never imports chromadb. When ChromaDB is actually in use,
+    ``get_embedder()`` returns a runtime subclass that additionally inherits from
+    ``chromadb.utils.embedding_functions.EmbeddingFunction``, satisfying ChromaDB's
+    isinstance/signature validation without any import-time dependency.
     """
 
     def __init__(self, dim: int = 384):
@@ -47,6 +52,39 @@ class MockEmbeddingFunction(embedding_functions.EmbeddingFunction):
         return embeddings
 
 
+_EMBEDDING_FUNCTIONS: Any | None = None
+
+
+def _embedding_functions() -> Any:
+    """Lazily imports ``chromadb.utils.embedding_functions`` (cached) to keep module import chromadb-free."""
+    global _EMBEDDING_FUNCTIONS
+    if _EMBEDDING_FUNCTIONS is None:
+        from chromadb.utils import embedding_functions
+
+        _EMBEDDING_FUNCTIONS = embedding_functions
+    return _EMBEDDING_FUNCTIONS
+
+
+_MOCK_BRIDGE: type[MockEmbeddingFunction] | None = None
+
+
+def _chromadb_mock(dim: int = 384) -> MockEmbeddingFunction:
+    """Returns a mock embedder that ChromaDB's runtime validation accepts as an EmbeddingFunction."""
+    global _MOCK_BRIDGE
+    try:
+        base = _embedding_functions().EmbeddingFunction
+    except Exception:
+        base = None
+    if base is None:
+        return MockEmbeddingFunction(dim=dim)
+    if _MOCK_BRIDGE is None:
+        class _ChromadbMockEmbeddingFunction(MockEmbeddingFunction, base):
+            """Runtime-only subclass bridging the standalone mock into ChromaDB's EmbeddingFunction protocol."""
+
+        _MOCK_BRIDGE = _ChromadbMockEmbeddingFunction
+    return _MOCK_BRIDGE(dim=dim)
+
+
 def get_embedder(provider: str = "sentence-transformers", model_name: str | None = None, api_key: str | None = None):
     """
     Returns a ChromaDB-compatible embedding function based on the provider.
@@ -58,12 +96,12 @@ def get_embedder(provider: str = "sentence-transformers", model_name: str | None
     prov = provider.lower().strip()
 
     if prov in ("mock", "deterministic", "test"):
-        return MockEmbeddingFunction()
+        return _chromadb_mock()
 
     elif prov == "sentence-transformers":
         if not model_name:
             model_name = "all-MiniLM-L6-v2"
-        return embedding_functions.SentenceTransformerEmbeddingFunction(model_name=model_name)
+        return _embedding_functions().SentenceTransformerEmbeddingFunction(model_name=model_name)
 
     elif prov == "openai":
         if not model_name:
@@ -72,6 +110,6 @@ def get_embedder(provider: str = "sentence-transformers", model_name: str | None
             api_key = os.environ.get("OPENAI_API_KEY")
             if not api_key:
                 raise ValueError("OPENAI_API_KEY environment variable is required for OpenAI embedder")
-        return embedding_functions.OpenAIEmbeddingFunction(api_key=api_key, model_name=model_name)
+        return _embedding_functions().OpenAIEmbeddingFunction(api_key=api_key, model_name=model_name)
     else:
         raise ValueError(f"Unknown embedder provider: {provider}. Supported: sentence-transformers, openai, mock")

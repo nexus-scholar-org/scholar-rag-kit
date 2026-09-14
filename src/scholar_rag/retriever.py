@@ -6,13 +6,13 @@ import datetime
 import json
 import re
 from pathlib import Path
-from typing import Any
-
-import chromadb
-import networkx as nx
+from typing import TYPE_CHECKING, Any
 
 from scholar_rag.embedder import get_embedder
 from scholar_rag.models import RetrievalResult
+
+if TYPE_CHECKING:
+    import networkx as nx
 
 
 class ScholarRetriever:
@@ -35,6 +35,8 @@ class ScholarRetriever:
         self.embedder_kwargs = embedder_kwargs
         self.embedder = get_embedder(**embedder_kwargs)
 
+        import chromadb  # deferred: keeps `import scholar_rag.retriever` chromadb-free
+
         self.client = chromadb.PersistentClient(path=db_path)
         try:
             self.collection = self.client.get_collection(name=collection_name, embedding_function=self.embedder)
@@ -51,6 +53,8 @@ class ScholarRetriever:
     @staticmethod
     def _load_pagerank_from_graph(graph_source: nx.DiGraph | Path | str | dict[str, float]) -> dict[str, float]:
         """Calculates or extracts normalized PageRank scores from a citation graph."""
+        import networkx as nx  # deferred: keeps `import scholar_rag.retriever` networkx-free
+
         if isinstance(graph_source, dict):
             return graph_source
 
