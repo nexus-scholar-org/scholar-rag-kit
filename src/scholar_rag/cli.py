@@ -319,7 +319,9 @@ def consensus(
             embedder = get_embedder(provider=similarity, model_name=model_name)
             similarity_fn = embedder_claim_scorer(embedder)
         except Exception as exc:
-            console.print(f"[bold yellow]Warning:[/bold yellow] {similarity} scorer unavailable ({exc}); using lexical Jaccard.")
+            console.print(
+                f"[bold yellow]Warning:[/bold yellow] {similarity} scorer unavailable ({exc}); using lexical Jaccard."
+            )
             similarity_fn = None
 
     cartographer = ConsensusCartographer(similarity_fn=similarity_fn)
@@ -437,6 +439,49 @@ def stats(
     console.print(f"[bold cyan]Database Path:[/bold cyan] {db_path}")
     console.print(f"[bold cyan]Collection Name:[/bold cyan] {collection}")
     console.print(f"[bold yellow]Total Indexed Chunks:[/bold yellow] {count}")
+
+
+@app.command("extract")
+def extract(
+    input_file: Path = typer.Argument(..., help="Input markdown file"),
+    schema: str = typer.Option("paper", "--schema", "-s", help="Extraction schema"),
+    output: Path = typer.Option(None, "--output", "-o", help="Output JSON file"),
+    api_key: str = typer.Option(None, "--api-key", "-k", help="Gemini API key"),
+):
+    """Extract structured metadata from a document using LLM."""
+    import asyncio
+
+    from .extractor import LLMExtractor
+    from .schemas import PaperExtraction
+
+    schema_registry = {"paper": PaperExtraction}
+
+    if schema not in schema_registry:
+        raise typer.BadParameter(f"Unknown schema: {schema}. Available: {list(schema_registry.keys())}")
+
+    if not input_file.exists():
+        raise typer.BadParameter(f"Input file not found: {input_file}")
+
+    text = input_file.read_text(encoding="utf-8")
+    extractor = LLMExtractor(api_key=api_key)
+
+    async def _run():
+        return await extractor.extract_from_text(
+            text,
+            schema=schema_registry[schema],
+            source_file=str(input_file),
+        )
+
+    result = asyncio.run(_run())
+
+    # Output
+    output_str = result.model_dump_json(indent=2)
+
+    if output:
+        output.write_text(output_str, encoding="utf-8")
+        console.print(f"[green]Extraction written to {output}[/]")
+    else:
+        console.print(output_str)
 
 
 if __name__ == "__main__":

@@ -78,6 +78,7 @@ def _chromadb_mock(dim: int = 384) -> MockEmbeddingFunction:
     if base is None:
         return MockEmbeddingFunction(dim=dim)
     if _MOCK_BRIDGE is None:
+
         class _ChromadbMockEmbeddingFunction(MockEmbeddingFunction, base):
             """Runtime-only subclass bridging the standalone mock into ChromaDB's EmbeddingFunction protocol."""
 
@@ -91,6 +92,7 @@ def get_embedder(provider: str = "sentence-transformers", model_name: str | None
     Supported providers:
       - 'sentence-transformers' (default model: all-MiniLM-L6-v2)
       - 'openai' (default model: text-embedding-3-small)
+      - 'gemini' (default model: text-embedding-004)
       - 'mock' / 'deterministic' (for unit tests / CI without GPU/downloads)
     """
     prov = provider.lower().strip()
@@ -111,5 +113,56 @@ def get_embedder(provider: str = "sentence-transformers", model_name: str | None
             if not api_key:
                 raise ValueError("OPENAI_API_KEY environment variable is required for OpenAI embedder")
         return _embedding_functions().OpenAIEmbeddingFunction(api_key=api_key, model_name=model_name)
+    elif prov == "gemini":
+        if not model_name:
+            model_name = "text-embedding-004"
+        return GeminiEmbedding(api_key=api_key, model_name=model_name)
     else:
-        raise ValueError(f"Unknown embedder provider: {provider}. Supported: sentence-transformers, openai, mock")
+        raise ValueError(
+            f"Unknown embedder provider: {provider}. Supported: sentence-transformers, openai, gemini, mock"
+        )
+
+
+class GeminiEmbedding:
+    """Gemini API embedding model for vector storage."""
+
+    def __init__(self, api_key: str | None = None, model_name: str = "text-embedding-004"):
+        """Initialize with API key and model name."""
+        import os
+
+        self._api_key = api_key or os.environ.get("GEMINI_API_KEY")
+        self._model_name = model_name
+        self._client = None
+
+    def _ensure_initialized(self):
+        """Lazy initialization of Gemini client."""
+        if self._client is None:
+            if not self._api_key:
+                raise ValueError("GEMINI_API_KEY not set. Pass api_key parameter or set GEMINI_API_KEY env var.")
+            import google.generativeai as genai
+
+            genai.configure(api_key=self._api_key)
+            self._client = genai
+
+    @property
+    def dimension(self) -> int:
+        """Return embedding dimension (768 for text-embedding-004)."""
+        return 768
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        """Embed a list of texts using Gemini API."""
+        self._ensure_initialized()
+
+        all_embeddings = []
+        batch_size = 100
+
+        for i in range(0, len(texts), batch_size):
+            batch = texts[i : i + batch_size]
+            result = self._client.embed_content(
+                model=self._model_name,
+                content=batch,
+                task_type="RETRIEVAL_DOCUMENT",
+            )
+            all_embeddings.extend(result["embedding"])
+
+        return all_embeddings

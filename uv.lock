@@ -3273,7 +3273,7 @@ wheels = [
 [[package]]
 name = "scholar-bib-kit"
 version = "0.1.0"
-source = { directory = "../scholar-bib-kit" }
+source = { editable = "../scholar-bib-kit" }
 dependencies = [
     { name = "bibtexparser" },
     { name = "pydantic" },
@@ -3287,14 +3287,14 @@ requires-dist = [
     { name = "bibtexparser", specifier = ">=2.0.0b7" },
     { name = "pydantic", specifier = ">=2.0.0" },
     { name = "rich", specifier = ">=13.0.0" },
-    { name = "scholar-search-kit", directory = "../scholar-search-kit" },
+    { name = "scholar-search-kit", editable = "../scholar-search-kit" },
     { name = "typer", specifier = ">=0.9.0" },
 ]
 
 [[package]]
 name = "scholar-graph-kit"
 version = "0.1.0"
-source = { directory = "../scholar-graph-kit" }
+source = { editable = "../scholar-graph-kit" }
 dependencies = [
     { name = "aiohttp" },
     { name = "networkx" },
@@ -3312,7 +3312,7 @@ requires-dist = [
     { name = "pydantic", specifier = ">=2.0.0" },
     { name = "pyvis", specifier = ">=0.3.2" },
     { name = "rich", specifier = ">=13.0.0" },
-    { name = "scholar-search-kit", directory = "../scholar-search-kit" },
+    { name = "scholar-search-kit", editable = "../scholar-search-kit" },
     { name = "typer", specifier = ">=0.9.0" },
 ]
 
@@ -3354,9 +3354,9 @@ requires-dist = [
     { name = "pytest-cov", marker = "extra == 'dev'", specifier = ">=4.0.0" },
     { name = "rich", specifier = ">=13.0.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.1.0" },
-    { name = "scholar-bib-kit", directory = "../scholar-bib-kit" },
-    { name = "scholar-graph-kit", directory = "../scholar-graph-kit" },
-    { name = "scholar-search-kit", directory = "../scholar-search-kit" },
+    { name = "scholar-bib-kit", editable = "../scholar-bib-kit" },
+    { name = "scholar-graph-kit", editable = "../scholar-graph-kit" },
+    { name = "scholar-search-kit", editable = "../scholar-search-kit" },
     { name = "sentence-transformers", specifier = ">=2.3.1" },
     { name = "typer", specifier = ">=0.9.0" },
 ]
@@ -3365,7 +3365,7 @@ provides-extras = ["dev"]
 [[package]]
 name = "scholar-search-kit"
 version = "0.1.0"
-source = { directory = "../scholar-search-kit" }
+source = { editable = "../scholar-search-kit" }
 dependencies = [
     { name = "hishel" },
     { name = "httpx" },

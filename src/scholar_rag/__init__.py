@@ -1,8 +1,10 @@
 """Scholar RAG Kit: Scientific structural chunking, hybrid graph-boosted retrieval, and grounded synthesis."""
 
+from scholar_rag.backends import NumpyBackend, VectorBackend
 from scholar_rag.chunker import MarkdownChunker
 from scholar_rag.consensus import ConsensusCartographer, classify_stance, embedder_claim_scorer, jaccard_claim_scorer
 from scholar_rag.embedder import get_embedder
+from scholar_rag.extractor import LLMExtractor
 from scholar_rag.indexer import ScholarIndexer
 from scholar_rag.matrix import MatrixExtractor
 from scholar_rag.models import (
@@ -20,12 +22,15 @@ from scholar_rag.models import (
     SynthesisResult,
     classify_section,
 )
+from scholar_rag.redactor import PIIRedactor
 from scholar_rag.retriever import ScholarRetriever
+from scholar_rag.schemas import AuthorExtraction, ExtractionResult, PaperExtraction
 from scholar_rag.synthesis import GroundedSynthesisEngine, generate_methodology_matrix
 
 __version__ = "0.1.0"
 
 __all__ = [
+    "AuthorExtraction",
     "Chunk",
     "ChunkMetadata",
     "ClaimGroup",
@@ -33,17 +38,23 @@ __all__ = [
     "ConsensusCartographer",
     "ConsensusReport",
     "ConsensusVerdict",
+    "ExtractionResult",
     "GroundedSynthesisEngine",
+    "LLMExtractor",
     "MarkdownChunker",
     "MatrixExtractor",
     "MethodologyMatrixRow",
     "MethodologyMetadata",
+    "NumpyBackend",
+    "PIIRedactor",
+    "PaperExtraction",
     "RetrievalResult",
     "ScholarIndexer",
     "ScholarRetriever",
     "SectionCategory",
     "SynthesisClaim",
     "SynthesisResult",
+    "VectorBackend",
     "classify_section",
     "classify_stance",
     "embedder_claim_scorer",
