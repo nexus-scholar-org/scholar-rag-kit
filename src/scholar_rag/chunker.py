@@ -218,7 +218,7 @@ class InvalidConfigurationValueError(ChunkerConfigurationError):
         state = (
             "is required by the closed option set but was not supplied"
             if absent
-            else f"= {value!r} is not accepted; accepted: {accepted}"
+            else f"value {value!r} is not accepted; accepted: {accepted}"
         )
         super().__init__(f"chunker configuration refuses option {option!r}: {state}.")
 
@@ -554,9 +554,10 @@ class MarkdownChunker:
           reduces the chunk count, so it terminates; order is preserved and no
           chunk is ever reordered.
 
-        ``min_chunk_chars=1`` is a legitimate threshold with no reachable effect:
-        no non-empty chunk is shorter than one character, so the pass simply never
-        fires.  That is the same honesty class as a ``max_chunk_chars`` large
+        ``min_chunk_chars <= 1`` is a legitimate threshold with a narrow effect:
+        no *non-empty* chunk is shorter than one character, so the pass can fire
+        only on an empty (zero-length) chunk, and every non-empty chunk is
+        unaffected.  That is the same honesty class as a ``max_chunk_chars`` large
         enough that nothing splits - the option is still read and still honored.
         """
 
