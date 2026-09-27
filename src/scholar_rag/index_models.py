@@ -11,7 +11,11 @@ Errors
 ------
 Every refusal subclasses :class:`ValueError`, so callers that already assert
 ``isinstance(exc, ValueError)`` (including the untouched CLI refusal, which
-``tests/test_cli.py`` pins) keep working while gaining a typed ``code``.
+``tests/test_cli.py`` pins) keep working while gaining a typed ``code``.  The
+chunker-configuration refusals
+(:class:`~scholar_rag.chunker.ChunkerConfigurationError` and its two
+subclasses) are defined in the chunker and re-exported above, so the whole
+taxonomy is reachable from this one boundary module.
 
 Presence vs. pydantic
 ---------------------
@@ -33,6 +37,18 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, PrivateAttr
 
 from scholar_rag.chunker import IDENTITY_LIMB_KEYS, _present
+
+# The chunker-configuration refusals belong to the same request-boundary
+# taxonomy as the errors below, so they are re-exported here rather than
+# re-declared.  They are *defined* in ``scholar_rag.chunker`` (which must not
+# import this module, or the identity-limb import above becomes a cycle), and the
+# redundant-alias spelling marks them as deliberate re-exports.  A caller
+# catching the boundary taxonomy therefore also catches an unrecognized
+# configuration key (``E3-NEG-024``) and an invalid configuration value
+# (``E3-NEG-027``) without importing a second module.
+from scholar_rag.chunker import ChunkerConfigurationError as ChunkerConfigurationError
+from scholar_rag.chunker import InvalidConfigurationValueError as InvalidConfigurationValueError
+from scholar_rag.chunker import UnrecognizedConfigurationKeyError as UnrecognizedConfigurationKeyError
 
 #: Default scope label when a caller does not name the document being indexed.
 DEFAULT_SCOPE = "the submitted markdown document"
