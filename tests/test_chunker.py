@@ -134,7 +134,11 @@ We evaluate algorithms.
     assert len(chunks) == 1
     meta = chunks[0].metadata
     assert meta.doi == "10.1234/test.doi"
-    assert meta.workspace_id == "WS-42"
+    # The frontmatter's "WS-42" is decoration and must not restate the identity
+    # the parent registry bound: the id was minted under base_metadata's
+    # workspace_id, so the metadata shipped with the Chunk has to say the same.
+    assert meta.workspace_id == IDENTITY_BLOCK["workspace_id"]
+    assert meta.workspace_id != "WS-42"
     assert meta.methodology is not None
     assert meta.methodology.paradigm == "Design Science"
     assert meta.methodology.study_design == "Benchmark Evaluation"

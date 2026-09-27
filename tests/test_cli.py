@@ -39,16 +39,26 @@ Reasoning accuracy increased by 22%.
     # identity block (the CLI infers only filename/workspace-id, and that
     # inference is owned by E3-T-30), so the chunker refuses with a typed error
     # instead of minting a positional or content-derived fallback identity.
+    #
+    # KNOWN GAP, pinned deliberately: this refusing path exits non-zero with NO
+    # user-visible error text.  Typer swallows the ValueError, so the only output
+    # is the init/spinner/path chatter; the limb names never reach the user.  The
+    # assertions below therefore read the refusal out of
+    # ``index_res.exception`` rather than the console, and the gap is pinned in
+    # ``test_cli_refusal_error_text_is_not_yet_surfaced_to_the_user``.  Mapping
+    # and surfacing CLI errors is assigned to E3-T-30 / E3-T-90 and is explicitly
+    # out of scope for T-20, which must not change cli.py.
     index_res = runner.invoke(
         app, ["index", str(docs_dir), "--db-path", str(db_dir), "--embedder", "mock", "--no-journal"]
     )
     assert index_res.exit_code != 0
-    refusal_text = " ".join(part for part in (_plain(index_res.output), str(index_res.exception)) if part)
+    console_text = _plain(index_res.output)
+    refusal_text = " ".join(part for part in (console_text, str(index_res.exception)) if part)
     assert "refuses to mint chunk identity" in refusal_text
     for limb in ("workspace_id", "study_id", "document_id", "parent_artifact_id", "extracted_content_sha256"):
         assert limb in refusal_text
-    assert "Indexed 1 files" not in _plain(index_res.output)
-    assert "Successfully indexed" not in _plain(index_res.output)
+    assert "Indexed 1 files" not in console_text
+    assert "Successfully indexed" not in console_text
 
     # 2. Query command
     query_res = runner.invoke(
@@ -82,3 +92,41 @@ Reasoning accuracy increased by 22%.
     assert "No papers found" in _plain(matrix_res.output)
     assert not (tmp_path / "test_matrix.md").exists()
     assert not (tmp_path / "test_matrix.json").exists()
+
+
+def test_cli_refusal_error_text_is_not_yet_surfaced_to_the_user(tmp_path):
+    """Pins the D3 gap: the identity refusal is invisible at the console.
+
+    ``scholar-rag index`` correctly refuses (fail-closed, non-zero exit) when a
+    directory carries no accepted identity block, but typer lets the ValueError
+    escape without printing it, so an operator sees a non-zero exit and no
+    explanation.  Surfacing that error is assigned to E3-T-30 / E3-T-90; T-20 is
+    forbidden from touching cli.py, so this test records the current behaviour
+    instead of the desired one.  When T-30 lands and the message is printed, this
+    test is expected to FAIL and be inverted - that is the point of pinning it.
+    """
+    docs_dir = tmp_path / "papers"
+    docs_dir.mkdir()
+    (docs_dir / "paper.md").write_text("# Introduction\n\nA claim.\n", encoding="utf-8")
+
+    result = runner.invoke(
+        app,
+        [
+            "index",
+            str(docs_dir),
+            "--db-path",
+            str(tmp_path / "cli_gap_db"),
+            "--embedder",
+            "mock",
+            "--no-journal",
+        ],
+    )
+    console_text = _plain(result.output)
+
+    # The failure is real and typed...
+    assert result.exit_code != 0
+    assert isinstance(result.exception, ValueError)
+    # ...but nothing of it reaches the operator.
+    assert "refuses to mint chunk identity" not in console_text
+    for limb in ("workspace_id", "study_id", "document_id"):
+        assert limb not in console_text

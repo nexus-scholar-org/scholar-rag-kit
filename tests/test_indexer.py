@@ -64,7 +64,13 @@ This is the introduction.
     assert indexer.get_collection_count() == 0
 
 
-def test_index_directory_with_bib_metadata(tmp_path):
+def test_index_directory_refuses_without_identity(tmp_path):
+    # Named for what it asserts.  It used to be called
+    # test_index_directory_with_bib_metadata, which promised a success path that
+    # cannot be reached yet: the success path needs index_directory to assemble
+    # an accepted identity block, and that inference is owned by E3-T-30.  Until
+    # T-30 lands there is no honest way to make this test index anything, so it
+    # pins the fail-closed behaviour instead.
     docs_dir = tmp_path / "papers"
     docs_dir.mkdir()
 

@@ -25,8 +25,11 @@ This file is the executable owner of four things:
 ``NEGATIVES``
     ``E3-NEG-001..008`` (one mutated limb must move the id), ``E3-NEG-033``
     (uppercase ``CHK-`` only, and the legacy lowercase form is not a contract id)
-    and ``E3-NEG-051`` (no positional counter segment: inserting a preceding
-    section must not renumber the chunks after it).
+    and ``E3-NEG-051`` (a behaviour-affecting **configuration change** moves every
+    id, because the configuration fingerprint is a minted limb).  The *absence of a
+    positional counter segment* is a separate, separately-tested invariant rather
+    than a ledger row: inserting or removing a preceding section must not renumber
+    the chunks after it.
 
 Two deletions are asserted as well, because a deprecated generator that is still
 callable is still a positional identity source: the chunker must expose neither
@@ -250,7 +253,7 @@ def test_chunker_mints_with_its_own_algorithm_and_configuration_fingerprint():
     assert chunker.configuration_fingerprint == BASE_INPUT["chunker_configuration_fingerprint"]
 
 
-def test_a_behaviour_affecting_configuration_change_moves_every_id():
+def test_neg_051_a_behaviour_affecting_configuration_change_moves_every_id():
     baseline = MarkdownChunker().configuration_fingerprint
     retuned = MarkdownChunker(max_chunk_chars=900).configuration_fingerprint
     assert retuned != baseline
@@ -473,6 +476,110 @@ We evaluate algorithms.
     assert chunks[0].metadata.methodology.paradigm == "Design Science"
 
 
+def test_frontmatter_never_rebinds_identity_in_the_emitted_chunk_metadata():
+    # F-META regression.  The identity limbs are resolved from base_metadata
+    # *before* the frontmatter is read, so the mint is already bound to the
+    # accepted namespace.  The metadata that ships with the Chunk used to be
+    # merged as {**base_metadata, **fm_meta} with only
+    # title/authors/year/doi/paradigm/study_design re-pinned, which let a
+    # document's own YAML restate workspace_id and paper_id: the id was minted
+    # under WSP-0123... while metadata.workspace_id reported WSP-9999..., an
+    # id/metadata inconsistency.  The frontmatter here claims every limb.
+    impostor = """---
+workspace_id: WSP-99999999999999999999999999999999
+paper_id: FRONTMATTER-PAPER
+study_id: STU-99999999999999999999999999999999
+document_id: DOC-99999999999999999999999999999999
+parent_artifact_id: ART-99999999999999999999999999999999
+parent_artifact_sha256: sha256:9999999999999999999999999999999999999999999999999999999999999999
+extracted_content_sha256: sha256:8888888888888888888888888888888888888888888888888888888888888888
+doi: "10.1234/frontmatter.doi"
+title: Frontmatter Title
+---
+
+# Methods
+
+We ran the study.
+"""
+    base = {**IDENTITY_BLOCK, "paper_id": "ACCEPTED-PAPER"}
+    chunk = MarkdownChunker().chunk(impostor, base_metadata=dict(base))[0]
+
+    # The bound namespace and the legacy identity field come from base_metadata.
+    assert chunk.metadata.workspace_id == WORKSPACE_NAMESPACE
+    assert chunk.metadata.workspace_id != "WSP-99999999999999999999999999999999"
+    assert chunk.metadata.paper_id == "ACCEPTED-PAPER"
+    assert chunk.metadata.paper_id != "FRONTMATTER-PAPER"
+
+    # Non-identity frontmatter enrichment still works: the restriction is on
+    # re-binding identity, not on the document decorating its own chunks.
+    assert chunk.metadata.title == "Frontmatter Title"
+    assert chunk.metadata.doi == "10.1234/frontmatter.doi"
+
+    # And the metadata now agrees with the namespace the id was minted under.
+    assert chunk.metadata.workspace_id == IDENTITY_BLOCK["workspace_id"]
+
+
+def test_frontmatter_identity_claim_never_moves_the_id():
+    # The companion to the test above: frontmatter claiming another workspace
+    # must not even change the minted id, let alone the metadata.
+    plain = "# Methods\n\nWe ran the study.\n"
+    impostor = "---\nworkspace_id: WSP-99999999999999999999999999999999\npaper_id: FRONTMATTER-PAPER\n---\n\n" + plain
+    with_frontmatter = MarkdownChunker().chunk(impostor, base_metadata=dict(IDENTITY_BLOCK))[0]
+    without = MarkdownChunker().chunk(plain, base_metadata=dict(IDENTITY_BLOCK))[0]
+    assert with_frontmatter.chunk_id == without.chunk_id
+
+
+# ===========================================================================
+# OUTER vs INTERNAL WHITESPACE: the honest form of the 5.1 normalization claim
+# ===========================================================================
+def test_outer_whitespace_only_difference_mints_identical_ids():
+    # _normalize is str.strip(), so leading/trailing blank space around a
+    # document is normalized away before the chunk text is hashed.  Two
+    # documents whose bodies differ ONLY in outer whitespace must therefore
+    # produce byte-identical ids, text for text.
+    body = "# Results\n\nReasoning accuracy increased by 22%.\n"
+    padded_left = "\n\n   \n" + body
+    padded_right = body + "\n\n   \n"
+    padded_both = "\n\t\n" + body + "\n\t\n"
+
+    left = MarkdownChunker().chunk(padded_left, base_metadata=dict(IDENTITY_BLOCK))
+    right = MarkdownChunker().chunk(padded_right, base_metadata=dict(IDENTITY_BLOCK))
+    both = MarkdownChunker().chunk(padded_both, base_metadata=dict(IDENTITY_BLOCK))
+
+    assert [c.chunk_id for c in left] == [c.chunk_id for c in right] == [c.chunk_id for c in both]
+    assert [c.text for c in left] == [c.text for c in right] == [c.text for c in both]
+
+
+def test_internal_whitespace_edit_mints_a_different_id():
+    # The mirror image, and the property the old _normalize docstring overclaimed
+    # in the other direction: internal whitespace is preserved verbatim, so it is
+    # part of the chunk text and moves the chunk_text_sha256 limb.
+    single = MarkdownChunker().chunk("# Results\n\nAlpha beta gamma.\n", base_metadata=dict(IDENTITY_BLOCK))
+    doubled = MarkdownChunker().chunk("# Results\n\nAlpha  beta gamma.\n", base_metadata=dict(IDENTITY_BLOCK))
+
+    assert single[0].text != doubled[0].text
+    assert text_fingerprint(single[0].text) != text_fingerprint(doubled[0].text)
+    assert single[0].chunk_id != doubled[0].chunk_id
+
+    # A paragraph split is internal whitespace too, and must move the id rather
+    # than being silently collapsed.
+    joined = MarkdownChunker().chunk("# Results\n\nAlpha beta. Gamma delta.\n", base_metadata=dict(IDENTITY_BLOCK))
+    split = MarkdownChunker().chunk("# Results\n\nAlpha beta.\n\nGamma delta.\n", base_metadata=dict(IDENTITY_BLOCK))
+    assert [c.chunk_id for c in joined] != [c.chunk_id for c in split]
+
+
+def test_normalize_docstring_states_the_actual_outer_versus_internal_property():
+    # Guards the F-WS finding at its root: the docstring used to promise that a
+    # whitespace-only edit is a non-change, which was false for internal
+    # whitespace.  Pin the honest wording so it cannot silently regress.
+    docstring = MarkdownChunker._normalize.__doc__ or ""
+    lowered = docstring.lower()
+    assert "outer" in lowered and "internal" in lowered
+    assert "verbatim" in lowered or "preserved" in lowered
+    # The false blanket claim must be gone.
+    assert "whitespace-only edit is a non-change" not in docstring
+
+
 def test_doc_id_is_deprecated_and_never_identity_bearing():
     chunker = MarkdownChunker()
     with pytest.warns(DeprecationWarning, match="not identity-bearing"):
@@ -489,7 +596,9 @@ def test_doc_id_is_deprecated_and_never_identity_bearing():
 
 
 # ===========================================================================
-# NEGATIVES: E3-NEG-033, E3-NEG-051, and the E3-NEG-001..008 mutation set
+# NEGATIVES: E3-NEG-033, E3-NEG-051 (the configuration-change limb), and the
+# E3-NEG-001..008 mutation set.  The no-positional-counter invariant below is
+# not a ledger row and is therefore named without an E3-NEG number.
 # ===========================================================================
 def test_neg_033_ids_are_uppercase_and_only_uppercase_validates():
     minted = MarkdownChunker().chunk(SAMPLE_DOC, base_metadata=dict(IDENTITY_BLOCK))[0].chunk_id
@@ -503,7 +612,7 @@ def test_neg_033_ids_are_uppercase_and_only_uppercase_validates():
         validate_identifier(IdentifierKind.CHUNK, lowercased)
 
 
-def test_neg_051_no_positional_counter_segment_is_ever_emitted():
+def test_no_positional_counter_segment_is_ever_emitted():
     chunks = MarkdownChunker().chunk(SAMPLE_DOC, base_metadata=dict(IDENTITY_BLOCK))
     for chunk in chunks:
         assert not POSITIONAL_COUNTER.search(chunk.chunk_id)
@@ -512,7 +621,7 @@ def test_neg_051_no_positional_counter_segment_is_ever_emitted():
         assert "chk-" not in chunk.chunk_id
 
 
-def test_neg_051_inserting_a_preceding_section_does_not_renumber_later_chunks():
+def test_inserting_a_preceding_section_does_not_renumber_later_chunks():
     # The inserted section is a *sibling*, so heading_path of the Methods chunk
     # is unchanged: any id movement here would be a leaked positional counter.
     tail_doc = "# Methods\n\nWe evaluated reasoning benchmarks on 500 tasks.\n"
@@ -527,7 +636,7 @@ def test_neg_051_inserting_a_preceding_section_does_not_renumber_later_chunks():
     assert len(after) == len(before) + 1
 
 
-def test_neg_051_removing_a_preceding_section_does_not_renumber_later_chunks():
+def test_removing_a_preceding_section_does_not_renumber_later_chunks():
     full = "# Introduction\n\nPreamble.\n\n# Methods\n\nWe evaluated reasoning benchmarks.\n"
     trimmed = "# Methods\n\nWe evaluated reasoning benchmarks.\n"
 
@@ -537,7 +646,7 @@ def test_neg_051_removing_a_preceding_section_does_not_renumber_later_chunks():
         assert with_intro[text] == chunk_id
 
 
-def test_neg_051_nesting_a_later_section_does_change_its_id():
+def test_nesting_a_later_section_does_change_its_id():
     # The mirror image of the two tests above: when heading_path really does
     # change, the id must follow it.  This is what proves the previous two tests
     # are observing a real invariance and not a frozen chunker.

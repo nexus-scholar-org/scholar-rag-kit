@@ -153,7 +153,9 @@ class MarkdownChunker:
         self.overlap_chars = overlap_chars
         # Recorded in the closed configuration set (handoff 4.6) and bound into
         # every chunk id.  It is stored and never read to gate output today; the
-        # CONFIGURATION_INEFFECTIVE debt is tracked for the T-30/T-90 owners.
+        # CONFIGURATION_INEFFECTIVE debt (E3-NEG-027) belongs to the T-40 owner.
+        # T-20 cannot leave it out: the frozen configuration fingerprint requires
+        # the key to be present in the fingerprinted option set.
         self.min_chunk_chars = min_chunk_chars
         self.heading_levels = tuple(sorted({int(level) for level in heading_levels}))
         if not self.heading_levels or self.heading_levels[0] < 1 or self.heading_levels[-1] > 6:
@@ -236,8 +238,19 @@ class MarkdownChunker:
     def _normalize(self, text: str) -> str:
         """Whitespace normalization applied before a chunk text is hashed and stored.
 
-        Normalizing *before* hashing is what makes a whitespace-only edit a
-        non-change and a word change a real change (handoff 5.1).
+        This is ``str.strip()`` and nothing more, so the honest property is an
+        **outer vs. internal** split (handoff 5.1):
+
+        - *Outer* whitespace — leading and trailing blank space around a chunk's
+          text — is normalized away, so a document that differs only in outer
+          whitespace mints byte-identical chunk ids.
+        - *Internal* whitespace, including the blank lines that separate
+          paragraphs, is **preserved verbatim**.  Editing it changes the chunk
+          text, so it moves the id via the ``chunk_text_sha256`` limb.
+
+        Collapsing internal whitespace is deliberately not done here: it would
+        destroy intra-chunk paragraph structure that the structural-AST chunker
+        is required to keep.
         """
 
         return text.strip() if self.normalize_whitespace else text
@@ -372,6 +385,17 @@ class MarkdownChunker:
         # Canonical provenance fields from companion metadata (e.g. BibTeX) take
         # precedence over a document's own (sometimes placeholder) frontmatter
         for _k in ("title", "authors", "year", "doi", "paradigm", "study_design"):
+            if base_metadata.get(_k):
+                merged_meta[_k] = base_metadata[_k]
+        # The six identity limbs are re-applied unconditionally.  They were
+        # resolved from base_metadata above, before any frontmatter was read, so
+        # they are known-present here and the mint is already bound to them; this
+        # only stops the merge from letting a document's own YAML block restate a
+        # *different* value in the metadata that ships with the Chunk.  Without
+        # this the id is bound to one workspace namespace while
+        # ``metadata.workspace_id`` reports another.  ``paper_id`` is not a limb
+        # but is legacy identity, so base_metadata wins for it too.
+        for _k in (*IDENTITY_LIMB_KEYS, "paper_id"):
             if base_metadata.get(_k):
                 merged_meta[_k] = base_metadata[_k]
 
