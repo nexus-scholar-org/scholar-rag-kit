@@ -38,6 +38,11 @@ Average latency overhead is 37ms per query.
         base_metadata={
             "doi": "10.1038/s41586-024",
             "workspace_id": "SCI-000412",
+            "study_id": "STU-44444444444444444444444444444444",
+            "document_id": "DOC-33333333333333333333333333333333",
+            "parent_artifact_id": "ART-11111111111111111111111111111111",
+            "parent_artifact_sha256": "sha256:" + "1a" * 32,
+            "extracted_content_sha256": "sha256:" + "5b" * 32,
             "paradigm": "Design Science",
             "study_design": "Benchmark Evaluation",
             "dataset": "HumanEval-X",
