@@ -5,13 +5,19 @@ Provenance of every golden literal below
 The expected values in this file were **not** hand-derived.  They were produced
 by *executing* the frozen Contract v1 primitives in the harness repo -
 ``src/scholar_harness/contracts/canonical.py`` and
-``src/scholar_harness/contracts/identifiers.py`` at harness commit ``d15a0108`` -
-with the generator script
-``C:/Users/mouadh/AppData/Local/Temp/opencode/e3_t10_golden_gen.py``, which wrote
-the battery to ``e3_t10_golden_battery.json`` in the same directory.  The harness
-is the source of truth: this kit restates the algorithms instead of importing
-them (see the module docstring of ``scholar_rag/canonical.py``), so the goldens
-are the only thing that keeps the restatement honest.
+``src/scholar_harness/contracts/identifiers.py`` at harness commit ``d15a0108``.
+The harness is the source of truth: this kit restates the algorithms instead of
+importing them (see the module docstring of ``scholar_rag/canonical.py``), so the
+goldens are the only thing that keeps the restatement honest.
+
+The battery is reproducible offline - no network, no backend, no workspace, no
+checked-in fixture - by the reproduction recipe of the WP-01 Packet E3 handoff
+section 5.5, ``docs/architecture/wp01_packet_e3_implementation_handoff.md``:
+check out harness commit ``d15a0108``, import the two frozen modules above, and
+call ``canonical_json_bytes`` / ``canonical_fingerprint`` / ``deterministic_id``
+on the inputs recorded in the tables below.  Every literal in this file - the
+escaped-JSON-pointer and set-like sort-key cases included - is the output of
+exactly that call.
 
 All 13 ``chunk_id`` limb ids in :data:`LIMB_IDS` were verified *exactly* against
 the normative limb table of the WP-01 Packet E3 handoff,
@@ -33,9 +39,9 @@ therefore builds a deliberately *different* implementation of one algorithm
 dimension, feeds it the same input, and asserts that the mutant diverges from
 the golden literal while the module under test does not.  The goldens are
 load-bearing - a real deviation in ``canonical.py`` (mutating its separators,
-its ``algorithm_version`` handling, its fingerprint spelling, or its prefix
-registry was verified to fail this suite) and any drift in a golden value both
-fail here.
+its ``algorithm_version`` handling, its fingerprint spelling, its prefix
+registry, its JSON-pointer escaping, or its set-like sort key was verified to
+fail this suite) and any drift in a golden value both fail here.
 """
 
 import ast
@@ -92,6 +98,93 @@ CANONICAL_JSON_CASES = [
         '{"doc":{"refs":[{"i":1},{"i":2}]}}',
     ),
     ("deep_nesting", {"a": {"b": {"c": {"d": [1, 2, {"e": 3}]}}}}, (), '{"a":{"b":{"c":{"d":[1,2,{"e":3}]}}}}'),
+]
+
+# ---------------------------------------------------------------------------
+# Battery A2 - set-like registration by ESCAPED JSON pointer, and the
+# canonicalization of the set-like SORT KEY.
+# ---------------------------------------------------------------------------
+# Every earlier set-like case registers an unescaped pointer ("/items"), so two
+# dimensions of the set-like stage were unpinned: the ``~1``/``~0`` escaping in
+# ``_pointer`` and the ``json.dumps`` spelling used to build the sort key.  Both
+# are pinned here, with literals derived from the frozen harness like the rest of
+# the battery.
+#
+# F1: a set-like pointer names a path, and a key containing "~" or "/" is only
+# reachable through its escaped spelling.  "/a~1b" reaches the key "a/b";
+# "/a~0b" reaches "a~b"; the literal, unescaped spelling is a *different* (and for
+# "a/b" a deeper) pointer that must not match, so its bytes are the order-preserving
+# ones.  Deleting the escaping therefore moves bytes in both directions.
+ESCAPED_POINTER_CASES = [
+    (
+        "escaped_pointer_slash_sorts",
+        {"a/b": [{"n": 2}, {"n": 1}, {"n": 3}]},
+        ("/a~1b",),
+        '{"a/b":[{"n":1},{"n":2},{"n":3}]}',
+    ),
+    (
+        "unescaped_pointer_slash_does_not_match",
+        {"a/b": [{"n": 2}, {"n": 1}, {"n": 3}]},
+        ("/a/b",),
+        '{"a/b":[{"n":2},{"n":1},{"n":3}]}',
+    ),
+    (
+        "unregistered_slash_key_preserves_order",
+        {"a/b": [{"n": 2}, {"n": 1}, {"n": 3}]},
+        (),
+        '{"a/b":[{"n":2},{"n":1},{"n":3}]}',
+    ),
+    (
+        "escaped_pointer_tilde_sorts",
+        {"a~b": [{"n": 2}, {"n": 1}, {"n": 3}]},
+        ("/a~0b",),
+        '{"a~b":[{"n":1},{"n":2},{"n":3}]}',
+    ),
+    (
+        "unregistered_tilde_key_preserves_order",
+        {"a~b": [{"n": 2}, {"n": 1}, {"n": 3}]},
+        (),
+        '{"a~b":[{"n":2},{"n":1},{"n":3}]}',
+    ),
+    (
+        "nested_pointer_escapes_both_characters",
+        {"outer": {"x~y/z": [{"k": "b"}, {"k": "a"}]}},
+        ("/outer/x~0y~1z",),
+        '{"outer":{"x~y/z":[{"k":"a"},{"k":"b"}]}}',
+    ),
+]
+
+# F2: the sort key is a canonical *rendering* of each element, so its own
+# ``sort_keys``/``ensure_ascii`` choice decides the order.  These elements are
+# multi-key objects and non-ASCII strings, which is what the earlier ASCII
+# single-key cases could not observe.  The key insertion order written here is the
+# battery's own and is preserved on purpose: it is invisible in the golden bytes
+# (keys are sorted) but decides whether the ``sort_keys`` mutant diverges.
+SET_LIKE_SORT_KEY_CASES = [
+    (
+        "set_like_multi_key_objects",
+        {"records": [{"b": 2, "a": 1}, {"a": 2, "b": 1}, {"a": 1, "b": 2}]},
+        ("/records",),
+        '{"records":[{"a":1,"b":2},{"a":1,"b":2},{"a":2,"b":1}]}',
+    ),
+    (
+        "set_like_non_ascii_strings",
+        {"tags": ["中", "é", "a", "É", "中b", "b中"]},
+        ("/tags",),
+        '{"tags":["a","b中","É","é","中","中b"]}',
+    ),
+    (
+        "set_like_multi_key_non_ascii_values",
+        {"items": [{"label": "é", "n": 2}, {"n": 1, "label": "中"}, {"label": "a", "n": 0}]},
+        ("/items",),
+        '{"items":[{"label":"a","n":0},{"label":"é","n":2},{"label":"中","n":1}]}',
+    ),
+    (
+        "set_like_multi_key_non_ascii_out_of_order",
+        {"rows": [{"z": "é", "a": 1}, {"a": 2, "z": "中"}, {"a": 1, "z": "é"}]},
+        ("/rows",),
+        '{"rows":[{"a":1,"z":"é"},{"a":1,"z":"é"},{"a":2,"z":"中"}]}',
+    ),
 ]
 
 # ---------------------------------------------------------------------------
@@ -392,6 +485,57 @@ def _mutant_bytes(value, *, set_like_arrays=(), **dump_overrides):
     return json.dumps(normalized, **kwargs).encode("utf-8")
 
 
+def _mutant_pointer_escaping_bytes(value, *, set_like_arrays=()):
+    """Canonical bytes with the ``~1``/``~0`` escaping deleted from ``_pointer``.
+
+    This is the F1 mutation: the ONLY change is the spelling of the pointer used
+    for set-like registration, so the module's own normalization, sort key and
+    dump stay untouched.  Registration silently stops matching the escaped
+    spelling (and starts matching the literal one), which is why the goldens
+    below are load-bearing rather than decorative.
+    """
+
+    def unescaped_pointer(path):
+        return "/" + "/".join(path) if path else ""
+
+    original = canonical_module._pointer
+    canonical_module._pointer = unescaped_pointer
+    try:
+        return canonical_json_bytes(value, set_like_arrays=set_like_arrays)
+    finally:
+        canonical_module._pointer = original
+
+
+def _mutant_set_like_sort_key_bytes(value, *, set_like_arrays=(), **sort_key_overrides):
+    """Canonical bytes whose set-like SORT KEY is canonicalized differently.
+
+    Normalization is the module's own (with the set-like pass disabled while
+    normalizing, so it is redone here) and pointer navigation is the module's
+    escaping, so only the ``json.dumps`` spelling of the sort key is mutated.
+    """
+
+    normalized = canonical_module._normalize_json(value, path=(), set_like_arrays=frozenset())
+    key_kwargs = {
+        "ensure_ascii": False,
+        "sort_keys": True,
+        "separators": (",", ":"),
+        "allow_nan": False,
+    }
+    key_kwargs.update(sort_key_overrides)
+    for pointer in set_like_arrays:
+        target = normalized
+        for part in pointer.lstrip("/").split("/"):
+            target = target[part.replace("~1", "/").replace("~0", "~")]
+        target.sort(key=lambda item: json.dumps(item, **key_kwargs))
+    return json.dumps(
+        normalized,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+
+
 def _mutant_deterministic_id(
     kind,
     workspace_namespace,
@@ -468,6 +612,72 @@ def test_array_order_stays_semantic_unless_the_pointer_is_registered_set_like():
     )
     # Registration is by JSON pointer, so a near-miss pointer never reorders.
     assert canonical_json_bytes(reverse, set_like_arrays=["/study_ids/0"]) == (b'{"study_ids":["STU-b","STU-a"]}')
+
+
+# ---------------------------------------------------------------------------
+# Battery A2: escaped set-like pointers and the set-like sort key
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    ("name", "value", "set_like_arrays", "expected"),
+    ESCAPED_POINTER_CASES,
+    ids=[case[0] for case in ESCAPED_POINTER_CASES],
+)
+def test_escaped_pointer_registration_matches_golden_battery(name, value, set_like_arrays, expected):
+    assert canonical_json_bytes(value, set_like_arrays=set_like_arrays) == expected.encode("utf-8")
+    assert canonical_fingerprint(value, set_like_arrays=set_like_arrays) == (
+        "sha256:" + hashlib.sha256(expected.encode("utf-8")).hexdigest()
+    )
+
+
+@pytest.mark.parametrize(
+    ("name", "value", "set_like_arrays", "expected"),
+    SET_LIKE_SORT_KEY_CASES,
+    ids=[case[0] for case in SET_LIKE_SORT_KEY_CASES],
+)
+def test_set_like_sort_key_canonicalization_matches_golden_battery(name, value, set_like_arrays, expected):
+    assert canonical_json_bytes(value, set_like_arrays=set_like_arrays) == expected.encode("utf-8")
+
+
+@pytest.mark.parametrize(
+    ("value", "escaped", "literal", "sorted_bytes", "unordered_bytes"),
+    [
+        (
+            {"a/b": [{"n": 2}, {"n": 1}, {"n": 3}]},
+            "/a~1b",
+            "/a/b",
+            b'{"a/b":[{"n":1},{"n":2},{"n":3}]}',
+            b'{"a/b":[{"n":2},{"n":1},{"n":3}]}',
+        ),
+        (
+            {"a~b": [{"n": 2}, {"n": 1}, {"n": 3}]},
+            "/a~0b",
+            "/a~b",
+            b'{"a~b":[{"n":1},{"n":2},{"n":3}]}',
+            b'{"a~b":[{"n":2},{"n":1},{"n":3}]}',
+        ),
+    ],
+    ids=["slash_in_key", "tilde_in_key"],
+)
+def test_pointer_escaping_is_load_because_the_literal_spelling_never_matches(
+    value, escaped, literal, sorted_bytes, unordered_bytes
+):
+    # Escaping is only load-bearing if the two spellings disagree, so pin both
+    # sides: the escaped pointer reorders the array, the literal one does not.
+    assert canonical_json_bytes(value, set_like_arrays=[escaped]) == sorted_bytes
+    assert canonical_json_bytes(value, set_like_arrays=[literal]) == unordered_bytes
+    assert canonical_json_bytes(value) == unordered_bytes
+    assert sorted_bytes != unordered_bytes
+
+
+def test_nested_escaped_pointer_must_escape_both_characters():
+    value = {"outer": {"x~y/z": [{"k": "b"}, {"k": "a"}]}}
+    assert canonical_json_bytes(value, set_like_arrays=["/outer/x~0y~1z"]) == (
+        b'{"outer":{"x~y/z":[{"k":"a"},{"k":"b"}]}}'
+    )
+    for near_miss in ("/outer/x~0y/z", "/outer/x~y~1z", "/x~0y~1z", "/outer/x~0y~1z/0"):
+        assert canonical_json_bytes(value, set_like_arrays=[near_miss]) == (
+            b'{"outer":{"x~y/z":[{"k":"b"},{"k":"a"}]}}'
+        )
 
 
 @pytest.mark.parametrize(
@@ -876,3 +1086,74 @@ def test_mutant_without_set_like_registration_diverges_from_the_golden_bytes():
     assert FINGERPRINT_SPELLING.fullmatch(golden_fingerprint)
     assert f"sha256:{hashlib.sha256(mutant).hexdigest()}" != golden_fingerprint
     assert canonical_fingerprint(value, set_like_arrays=("/items",)) == golden_fingerprint
+
+
+def test_mutant_pointer_escaping_removed_diverges_from_the_golden_bytes():
+    # The escaped registration stops matching, so the array keeps its input
+    # order; the literal registration starts matching, so the array is reordered.
+    # Both directions are pinned, because either half alone could pass.
+    slash = {"a/b": [{"n": 2}, {"n": 1}, {"n": 3}]}
+    assert canonical_json_bytes(slash, set_like_arrays=("/a~1b",)) == (b'{"a/b":[{"n":1},{"n":2},{"n":3}]}')
+    escaped_mutant = _mutant_pointer_escaping_bytes(slash, set_like_arrays=("/a~1b",))
+    assert escaped_mutant == b'{"a/b":[{"n":2},{"n":1},{"n":3}]}'
+    assert escaped_mutant != b'{"a/b":[{"n":1},{"n":2},{"n":3}]}'
+    literal_mutant = _mutant_pointer_escaping_bytes(slash, set_like_arrays=("/a/b",))
+    assert literal_mutant == b'{"a/b":[{"n":1},{"n":2},{"n":3}]}'
+    assert literal_mutant != b'{"a/b":[{"n":2},{"n":1},{"n":3}]}'
+
+    tilde = {"a~b": [{"n": 2}, {"n": 1}, {"n": 3}]}
+    assert canonical_json_bytes(tilde, set_like_arrays=("/a~0b",)) == (b'{"a~b":[{"n":1},{"n":2},{"n":3}]}')
+    tilde_mutant = _mutant_pointer_escaping_bytes(tilde, set_like_arrays=("/a~0b",))
+    assert tilde_mutant == b'{"a~b":[{"n":2},{"n":1},{"n":3}]}'
+    assert tilde_mutant != b'{"a~b":[{"n":1},{"n":2},{"n":3}]}'
+
+    nested = {"outer": {"x~y/z": [{"k": "b"}, {"k": "a"}]}}
+    assert canonical_json_bytes(nested, set_like_arrays=["/outer/x~0y~1z"]) == (
+        b'{"outer":{"x~y/z":[{"k":"a"},{"k":"b"}]}}'
+    )
+    nested_mutant = _mutant_pointer_escaping_bytes(nested, set_like_arrays=["/outer/x~0y~1z"])
+    assert nested_mutant == b'{"outer":{"x~y/z":[{"k":"b"},{"k":"a"}]}}'
+    assert nested_mutant != b'{"outer":{"x~y/z":[{"k":"a"},{"k":"b"}]}}'
+
+    # A genuine fingerprint-level drift, not only different bytes.
+    golden_fingerprint = canonical_fingerprint(slash, set_like_arrays=("/a~1b",))
+    assert FINGERPRINT_SPELLING.fullmatch(golden_fingerprint)
+    assert f"sha256:{hashlib.sha256(escaped_mutant).hexdigest()}" != golden_fingerprint
+
+
+def test_mutant_set_like_sort_key_canonicalization_diverges_from_the_golden_bytes():
+    # sort_keys=True -> False on the sort key: multi-key objects order by their
+    # own key insertion order instead of their canonical rendering.
+    records = {"records": [{"b": 2, "a": 1}, {"a": 2, "b": 1}, {"a": 1, "b": 2}]}
+    assert canonical_json_bytes(records, set_like_arrays=("/records",)) == (
+        b'{"records":[{"a":1,"b":2},{"a":1,"b":2},{"a":2,"b":1}]}'
+    )
+    sort_key_mutant = _mutant_set_like_sort_key_bytes(records, set_like_arrays=("/records",), sort_keys=False)
+    assert sort_key_mutant == b'{"records":[{"a":1,"b":2},{"a":2,"b":1},{"a":1,"b":2}]}'
+    assert sort_key_mutant != b'{"records":[{"a":1,"b":2},{"a":1,"b":2},{"a":2,"b":1}]}'
+
+    rows = {"rows": [{"z": "é", "a": 1}, {"a": 2, "z": "中"}, {"a": 1, "z": "é"}]}
+    assert canonical_json_bytes(rows, set_like_arrays=("/rows",)) == (
+        '{"rows":[{"a":1,"z":"é"},{"a":1,"z":"é"},{"a":2,"z":"中"}]}'.encode("utf-8")
+    )
+    rows_mutant = _mutant_set_like_sort_key_bytes(rows, set_like_arrays=("/rows",), sort_keys=False)
+    assert rows_mutant == '{"rows":[{"a":1,"z":"é"},{"a":2,"z":"中"},{"a":1,"z":"é"}]}'.encode("utf-8")
+    assert rows_mutant != '{"rows":[{"a":1,"z":"é"},{"a":1,"z":"é"},{"a":2,"z":"中"}]}'.encode("utf-8")
+
+    # ensure_ascii=False -> True on the sort key: non-ASCII strings order by
+    # their "\\uXXXX" escapes instead of their UTF-8 code points.
+    tags = {"tags": ["中", "é", "a", "É", "中b", "b中"]}
+    assert canonical_json_bytes(tags, set_like_arrays=("/tags",)) == (
+        '{"tags":["a","b中","É","é","中","中b"]}'.encode("utf-8")
+    )
+    ascii_mutant = _mutant_set_like_sort_key_bytes(tags, set_like_arrays=("/tags",), ensure_ascii=True)
+    assert ascii_mutant == '{"tags":["É","é","中","中b","a","b中"]}'.encode("utf-8")
+    assert ascii_mutant != '{"tags":["a","b中","É","é","中","中b"]}'.encode("utf-8")
+
+    items = {"items": [{"label": "é", "n": 2}, {"n": 1, "label": "中"}, {"label": "a", "n": 0}]}
+    assert canonical_json_bytes(items, set_like_arrays=("/items",)) == (
+        '{"items":[{"label":"a","n":0},{"label":"é","n":2},{"label":"中","n":1}]}'.encode("utf-8")
+    )
+    items_mutant = _mutant_set_like_sort_key_bytes(items, set_like_arrays=("/items",), ensure_ascii=True)
+    assert items_mutant == '{"items":[{"label":"é","n":2},{"label":"中","n":1},{"label":"a","n":0}]}'.encode("utf-8")
+    assert items_mutant != '{"items":[{"label":"a","n":0},{"label":"é","n":2},{"label":"中","n":1}]}'.encode("utf-8")

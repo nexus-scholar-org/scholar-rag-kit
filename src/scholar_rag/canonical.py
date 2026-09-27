@@ -3,12 +3,17 @@
 This module is a *reimplementation* of the frozen Contract v1 canonicalization
 and identifier formulas, not a byte-for-byte adapter: the kit deliberately does
 not import the harness package (neither at runtime nor at import time), so the
-algorithms are restated here and kept algorithm-identical.  The harness
-conformance suite pins this module against the shared golden payloads derived by
-executing ``scholar_harness.contracts.canonical`` and
-``scholar_harness.contracts.identifiers`` at harness commit ``d15a0108``, and
-``tests/test_canonical.py`` in this kit replays that same battery offline, so the
-pin stays checkable with no harness dependency.
+algorithms are restated here and kept algorithm-identical.
+
+The harness-side conformance test that will pin this module against the shared
+golden payloads is **pending** - it is scheduled at WP01-E3-T-120/T-140 and does
+not exist yet, so nothing in the harness repo checks this file as of this commit.
+Until it lands, the pin is held by this kit's own golden battery in
+``tests/test_canonical.py``: its literals were derived by executing
+``scholar_harness.contracts.canonical`` and ``scholar_harness.contracts.identifiers``
+at harness commit ``d15a0108`` and are replayed offline, so the check is available
+with no harness dependency.  When the harness conformance test arrives it must
+reproduce these same bytes.
 
 Restating the frozen primitives buys the retrieval boundary three things it
 cannot have by importing them: a standalone-buildable kit, a ``chunk_id`` formula
