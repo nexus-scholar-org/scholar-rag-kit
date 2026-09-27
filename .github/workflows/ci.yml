@@ -29,8 +29,8 @@ jobs:
 
       - name: Lint with ruff
         run: uv run ruff check src/ tests/
-        working-directory: tools/scholar-rag-kit
+        working-directory: .
 
       - name: Run test suite
         run: uv run pytest -v tests/
-        working-directory: tools/scholar-rag-kit
+        working-directory: .
