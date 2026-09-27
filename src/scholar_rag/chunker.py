@@ -248,6 +248,11 @@ class MarkdownChunker:
           paragraphs, is **preserved verbatim**.  Editing it changes the chunk
           text, so it moves the id via the ``chunk_text_sha256`` limb.
 
+        Both halves above hold for the default ``normalize_whitespace=True``, which
+        is also the only configuration the frozen battery fingerprint pins.  With
+        ``normalize_whitespace=False`` no normalization occurs at all, so an
+        outer-whitespace edit changes the chunk text and therefore the id.
+
         Collapsing internal whitespace is deliberately not done here: it would
         destroy intra-chunk paragraph structure that the structural-AST chunker
         is required to keep.
