@@ -1,13 +1,23 @@
 import json
 from pathlib import Path
+
 from typer.testing import CliRunner
 
-from scholar_protocol.models import MatrixDimension, ResearchProtocol
 from scholar_rag.cli import app
 from scholar_rag.indexer import ScholarIndexer
 from scholar_rag.matrix import MatrixExtractor
 
 runner = CliRunner()
+
+# Accepted identity block (handoff 5.1); index_markdown refuses without it.
+IDENTITY_BLOCK = {
+    "workspace_id": "SCI-000001",
+    "study_id": "STU-44444444444444444444444444444444",
+    "document_id": "DOC-33333333333333333333333333333333",
+    "parent_artifact_id": "ART-11111111111111111111111111111111",
+    "parent_artifact_sha256": "sha256:" + "1a" * 32,
+    "extracted_content_sha256": "sha256:" + "5b" * 32,
+}
 
 
 def test_matrix_extractor_dynamic(tmp_path: Path):
@@ -30,7 +40,7 @@ We evaluated on HumanEval-X containing 500 programming tasks.
 ## Results
 Achieved 72.4% pass@1 on synthetic code generation benchmark.
 """
-    indexer.index_markdown(sample_md, doc_id="SCI-000001")
+    indexer.index_markdown(sample_md, base_metadata=dict(IDENTITY_BLOCK), doc_id="SCI-000001")
 
     # 2. Define custom protocol
     protocol_dict = {
@@ -105,7 +115,9 @@ Achieved 72.4% pass@1 on synthetic code generation benchmark.
 def test_cli_matrix_command(tmp_path: Path):
     db_path = str(tmp_path / "chroma_db")
     indexer = ScholarIndexer(db_path=db_path, embedder_kwargs={"provider": "mock"})
-    indexer.index_markdown("# Dummy Paper\n## Abstract\nTest abstract.", doc_id="DOC1")
+    indexer.index_markdown(
+        "# Dummy Paper\n## Abstract\nTest abstract.", base_metadata=dict(IDENTITY_BLOCK), doc_id="DOC1"
+    )
 
     out_dir = tmp_path / "output"
     result = runner.invoke(app, ["matrix", "--db-path", db_path, "--output-dir", str(out_dir)])

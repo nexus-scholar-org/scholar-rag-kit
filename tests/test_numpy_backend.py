@@ -1,6 +1,7 @@
 """Tests for NumpyBackend vector storage."""
 
 import pytest
+
 from scholar_rag.backends import NumpyBackend, VectorBackend
 
 

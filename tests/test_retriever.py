@@ -38,11 +38,34 @@ We conduct a field study with 45 enterprise developers.
 # Results
 Defect density remains unchanged in legacy code.
 """
+    # Distinct accepted identity blocks (handoff 5.1): two documents in two
+    # studies must mint disjoint chunk ids, or the second upsert would overwrite
+    # the first and the filters below would see a single paper.
     indexer.index_markdown(
-        doc1, base_metadata={"doi": "10.1000/paper1", "workspace_id": "SCI-001", "paradigm": "Design Science"}
+        doc1,
+        base_metadata={
+            "doi": "10.1000/paper1",
+            "workspace_id": "SCI-001",
+            "study_id": "STU-11111111111111111111111111111111",
+            "document_id": "DOC-11111111111111111111111111111111",
+            "parent_artifact_id": "ART-11111111111111111111111111111111",
+            "parent_artifact_sha256": "sha256:" + "1a" * 32,
+            "extracted_content_sha256": "sha256:" + "5b" * 32,
+            "paradigm": "Design Science",
+        },
     )
     indexer.index_markdown(
-        doc2, base_metadata={"doi": "10.1000/paper2", "workspace_id": "SCI-002", "paradigm": "Positivist"}
+        doc2,
+        base_metadata={
+            "doi": "10.1000/paper2",
+            "workspace_id": "SCI-002",
+            "study_id": "STU-22222222222222222222222222222222",
+            "document_id": "DOC-22222222222222222222222222222222",
+            "parent_artifact_id": "ART-22222222222222222222222222222222",
+            "parent_artifact_sha256": "sha256:" + "2c" * 32,
+            "extracted_content_sha256": "sha256:" + "6e" * 32,
+            "paradigm": "Positivist",
+        },
     )
 
     retriever = ScholarRetriever(db_path=str(db_dir), collection_name="docs", embedder_kwargs={"provider": "mock"})

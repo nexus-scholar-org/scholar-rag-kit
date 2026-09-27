@@ -1,6 +1,7 @@
 """Tests for PIIRedactor."""
 
 import pytest
+
 from scholar_rag.redactor import PIIRedactor
 
 

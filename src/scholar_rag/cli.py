@@ -396,7 +396,7 @@ def matrix(
         )
         rows, csv_path, json_path = extractor.extract_all(output_dir=output_dir)
 
-        console.print(f"[bold green]Matrix extraction complete![/bold green]")
+        console.print("[bold green]Matrix extraction complete![/bold green]")
         console.print(f"  Extracted Studies: {len(rows)}")
         console.print(f"  CSV Matrix: {csv_path}")
         console.print(f"  JSON Matrix: {json_path}")

@@ -1,7 +1,20 @@
 """Unit tests for MarkdownChunker and section classification."""
 
+import pytest
+
 from scholar_rag.chunker import MarkdownChunker
 from scholar_rag.models import SectionCategory, classify_section
+
+# The accepted identity block (handoff 5.1) that every chunk() call must supply
+# through base_metadata.  The chunker fails closed without it.
+IDENTITY_BLOCK = {
+    "workspace_id": "WSP-0123456789abcdef0123456789abcdef",
+    "study_id": "STU-44444444444444444444444444444444",
+    "document_id": "DOC-33333333333333333333333333333333",
+    "parent_artifact_id": "ART-11111111111111111111111111111111",
+    "parent_artifact_sha256": "sha256:" + "1a" * 32,
+    "extracted_content_sha256": "sha256:" + "5b" * 32,
+}
 
 
 def test_classify_section():
@@ -35,7 +48,7 @@ Why this matters.
 System design.
 """
     chunker = MarkdownChunker(max_chunk_chars=1000)
-    chunks = chunker.chunk(doc, doc_id="TEST-001")
+    chunks = chunker.chunk(doc, base_metadata=dict(IDENTITY_BLOCK))
 
     assert len(chunks) == 4
 
@@ -60,13 +73,21 @@ def test_deterministic_chunk_ids():
     chunker = MarkdownChunker()
     doc = "# Methods\nStep 1.\n# Results\nOutcome 1."
 
-    chunks_run1 = chunker.chunk(doc, doc_id="SCI-100")
-    chunks_run2 = chunker.chunk(doc, doc_id="SCI-100")
+    chunks_run1 = chunker.chunk(doc, base_metadata=dict(IDENTITY_BLOCK))
+    chunks_run2 = chunker.chunk(doc, base_metadata=dict(IDENTITY_BLOCK))
 
     assert len(chunks_run1) == len(chunks_run2)
     for c1, c2 in zip(chunks_run1, chunks_run2):
         assert c1.chunk_id == c2.chunk_id
-        assert c1.chunk_id.startswith("chk-")
+        # Canonical CHK- ids (E3-NEG-033): uppercase prefix, opaque hex suffix.
+        assert c1.chunk_id.startswith("CHK-")
+        assert not c1.chunk_id.startswith("chk-")
+
+    # Ids are content-addressed, so a different document identity must move them
+    # even though the markdown, the locator, and the chunker are unchanged.
+    other = dict(IDENTITY_BLOCK, study_id="STU-55555555555555555555555555555555")
+    other_ids = {c.chunk_id for c in chunker.chunk(doc, base_metadata=other)}
+    assert {c.chunk_id for c in chunks_run1}.isdisjoint(other_ids)
 
 
 def test_size_guard_splitting():
@@ -76,13 +97,24 @@ def test_size_guard_splitting():
     doc = f"# Results\n\n{long_para1}\n\n{long_para2}"
 
     chunker = MarkdownChunker(max_chunk_chars=300, overlap_chars=50)
-    chunks = chunker.chunk(doc, doc_id="DOC-99")
+    chunks = chunker.chunk(doc, base_metadata=dict(IDENTITY_BLOCK))
 
     assert len(chunks) > 1
     for c in chunks:
         assert c.metadata.section == "Results"
         assert c.metadata.section_category == SectionCategory.RESULTS_EMPIRICAL.value
-        assert c.chunk_id.startswith("chk-")
+        assert c.chunk_id.startswith("CHK-")
+
+
+def test_chunking_without_an_identity_block_is_refused():
+    # E3-004: no fallback to doc_id/filename/doi/md5, and no positional id.
+    chunker = MarkdownChunker()
+    doc = "# Methods\nStep 1.\n# Results\nOutcome 1."
+
+    with pytest.raises(ValueError, match="refuses to mint chunk identity"):
+        chunker.chunk(doc)
+    with pytest.raises(ValueError, match="study_id"):
+        chunker.chunk(doc, base_metadata={"filename": "paper.md", "doi": "10.1234/x"})
 
 
 def test_frontmatter_extraction():
@@ -97,12 +129,16 @@ study_design: "Benchmark Evaluation"
 We evaluate algorithms.
 """
     chunker = MarkdownChunker()
-    chunks = chunker.chunk(doc)
+    chunks = chunker.chunk(doc, base_metadata=dict(IDENTITY_BLOCK))
 
     assert len(chunks) == 1
     meta = chunks[0].metadata
     assert meta.doi == "10.1234/test.doi"
-    assert meta.workspace_id == "WS-42"
+    # The frontmatter's "WS-42" is decoration and must not restate the identity
+    # the parent registry bound: the id was minted under base_metadata's
+    # workspace_id, so the metadata shipped with the Chunk has to say the same.
+    assert meta.workspace_id == IDENTITY_BLOCK["workspace_id"]
+    assert meta.workspace_id != "WS-42"
     assert meta.methodology is not None
     assert meta.methodology.paradigm == "Design Science"
     assert meta.methodology.study_design == "Benchmark Evaluation"

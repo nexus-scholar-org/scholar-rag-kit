@@ -1,6 +1,7 @@
 """Tests for LLMExtractor."""
 
 import pytest
+
 from scholar_rag.extractor import LLMExtractor
 
 
