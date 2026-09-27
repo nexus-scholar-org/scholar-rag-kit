@@ -14,8 +14,7 @@ from typing import Any, Callable
 
 from scholar_protocol.extraction import build_extraction_model
 from scholar_protocol.models import ResearchProtocol
-from scholar_rag.indexer import ScholarIndexer
-from scholar_rag.models import RetrievalResult
+
 from scholar_rag.retriever import ScholarRetriever
 
 

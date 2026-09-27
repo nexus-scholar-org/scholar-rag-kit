@@ -7,7 +7,7 @@ import re
 from typing import Any
 
 from .redactor import PIIRedactor
-from .schemas import ExtractionResult, PaperExtraction, AuthorExtraction
+from .schemas import ExtractionResult, PaperExtraction
 
 
 class LLMExtractor:
