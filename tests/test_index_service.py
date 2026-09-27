@@ -11,6 +11,7 @@ guarantee rather than a broken fixture.
 """
 
 import json
+from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
@@ -23,6 +24,7 @@ from scholar_rag.index_models import (
     IdentityMissingError,
     IndexDocumentRequest,
     IndexRequestError,
+    WorkspaceManifestUnreadableError,
 )
 from scholar_rag.indexer import ScholarIndexer
 
@@ -394,14 +396,74 @@ def test_directory_ignores_a_project_json_and_its_title(tmp_path, docs_dir):
 
 def test_directory_refuses_a_manifest_path_that_does_not_exist(tmp_path, docs_dir):
     indexer = _indexer(tmp_path)
-    with pytest.raises(IdentityMissingError):
+    with pytest.raises(WorkspaceManifestUnreadableError) as excinfo:
         indexer.index_directory(docs_dir=docs_dir, workspace_manifest=tmp_path / "absent.json", log_journal=False)
+    assert excinfo.value.code == "WORKSPACE_MANIFEST_UNREADABLE"
+    assert "not found" in str(excinfo.value)
+    assert indexer.get_collection_count() == 0
 
 
-def test_directory_refuses_a_mismatched_collection_before_reading_files(tmp_path, docs_dir):
+def test_directory_refuses_a_manifest_that_is_not_valid_json(tmp_path, docs_dir):
     indexer = _indexer(tmp_path)
+    broken = tmp_path / "broken.json"
+    broken.write_text("{ this is not json ", encoding="utf-8")
+    with pytest.raises(WorkspaceManifestUnreadableError) as excinfo:
+        indexer.index_directory(docs_dir=docs_dir, workspace_manifest=broken, log_journal=False)
+    assert excinfo.value.code == "WORKSPACE_MANIFEST_UNREADABLE"
+    assert "not valid JSON" in str(excinfo.value)
+    assert indexer.get_collection_count() == 0
+
+
+def test_directory_refuses_a_manifest_whose_json_root_is_not_an_object(tmp_path, docs_dir):
+    indexer = _indexer(tmp_path)
+    listy = tmp_path / "listy.json"
+    listy.write_text(json.dumps([_fields()]), encoding="utf-8")
+    with pytest.raises(WorkspaceManifestUnreadableError) as excinfo:
+        indexer.index_directory(docs_dir=docs_dir, workspace_manifest=listy, log_journal=False)
+    assert excinfo.value.code == "WORKSPACE_MANIFEST_UNREADABLE"
+    assert "not an object" in str(excinfo.value)
+    assert indexer.get_collection_count() == 0
+
+
+def test_identity_missing_error_names_only_field_names(tmp_path, docs_dir):
+    # A file-level failure must not masquerade as a field-level one: the two
+    # codes stay distinct so a caller can tell "this record is incomplete" from
+    # "this record cannot be read" without parsing prose.
+    data = _fields()
+    del data["study_id"]
+    with pytest.raises(IdentityMissingError) as excinfo:
+        IndexDocumentRequest(**data)
+    assert excinfo.value.missing == ["study_id"]
+    assert set(excinfo.value.missing) <= set(REQUIRED_REQUEST_FIELDS)
+    assert excinfo.value.code != WorkspaceManifestUnreadableError.code
+
+    indexer = _indexer(tmp_path)
+    with pytest.raises(WorkspaceManifestUnreadableError) as unreadable:
+        indexer.index_directory(docs_dir=docs_dir, workspace_manifest=tmp_path / "absent.json", log_journal=False)
+    assert not isinstance(unreadable.value, IdentityMissingError)
+    assert not hasattr(unreadable.value, "missing"), "a file-level failure names no field"
+
+
+def test_directory_refuses_a_mismatched_collection_before_reading_files(tmp_path, docs_dir, monkeypatch):
+    # The read-spy is what makes the name of this test true: without it the test
+    # would only prove the refusal and the empty collection, not the ordering.
+    # Any read of a document under docs_dir after the refusal is a hard failure.
+    indexer = _indexer(tmp_path)
+    real_read_text = Path.read_text
+    reads: list[Path] = []
+
+    def spy(self, *args, **kwargs):
+        try:
+            self.relative_to(docs_dir)
+        except ValueError:
+            return real_read_text(self, *args, **kwargs)
+        reads.append(self)
+        raise AssertionError(f"index_directory read {self} after the identity refusal")
+
+    monkeypatch.setattr(Path, "read_text", spy)
     with pytest.raises(CollectionMismatchError):
         indexer.index_directory(docs_dir=docs_dir, request=_request(collection="elsewhere"), log_journal=False)
+    assert reads == [], "identity must be resolved before any document is read"
     assert indexer.get_collection_count() == 0
 
 
@@ -437,3 +499,157 @@ def test_manifest_inheritance_ignores_unrelated_keys(tmp_path, docs_dir):
     result = indexer.index_directory(docs_dir=docs_dir, workspace_manifest=manifest, log_journal=False)
     assert result["indexed_files"] == 2
     assert result["identity"]["study_id"] == LIMBS["study_id"]
+
+
+# --------------------------------------------------------------------------
+# (g) the request is frozen, and both entry paths funnel through a refusal
+# --------------------------------------------------------------------------
+#
+# ``model_construct`` bypasses __init__ and therefore bypasses the presence
+# check performed there, and plain attribute assignment could blank a limb after
+# validation.  Both are closed here: the model is frozen, and the presence
+# re-check lives in to_base_metadata(), which every entry path must call before
+# a chunk can be minted.  Without that re-check a missing limb was str()-ed to
+# the literal "None" and minted into a contract-shaped chunk id.
+
+
+def test_model_construct_forgery_cannot_mint_any_chunk(tmp_path):
+    indexer = _indexer(tmp_path)
+    forged = IndexDocumentRequest.model_construct(
+        workspace_id=None,
+        study_id=None,
+        document_id=None,
+        parent_artifact_id=None,
+        parent_artifact_sha256=None,
+        extracted_content_sha256=None,
+        backend_provider="mock",
+        backend_model=None,
+        collection=COLLECTION,
+        run_id=None,
+    )
+    # The forged object really does carry six absent limbs ...
+    assert forged.missing_fields() == list(IDENTITY_LIMB_KEYS)
+
+    # ... and the single choke point refuses them, naming every one.
+    with pytest.raises(IdentityMissingError) as excinfo:
+        indexer.index_markdown(DOC, request=forged)
+    assert excinfo.value.missing == list(IDENTITY_LIMB_KEYS)
+    for limb in IDENTITY_LIMB_KEYS:
+        assert limb in str(excinfo.value)
+
+    # Nothing minted, nothing persisted, and no "None" reached the store.
+    assert indexer.get_collection_count() == 0
+
+
+def test_model_construct_forgery_cannot_mint_via_the_directory_path(tmp_path, docs_dir):
+    # The same forgery through the other entry path: identity is resolved before
+    # any document is read, so the refusal happens ahead of the glob.
+    indexer = _indexer(tmp_path)
+    forged = IndexDocumentRequest.model_construct(
+        workspace_id=None,
+        study_id=None,
+        document_id=None,
+        parent_artifact_id=None,
+        parent_artifact_sha256=None,
+        extracted_content_sha256=None,
+        backend_provider="mock",
+        backend_model=None,
+        collection=COLLECTION,
+        run_id=None,
+    )
+    with pytest.raises(IdentityMissingError) as excinfo:
+        indexer.index_directory(docs_dir=docs_dir, request=forged, log_journal=False)
+    assert excinfo.value.missing == list(IDENTITY_LIMB_KEYS)
+    assert indexer.get_collection_count() == 0
+
+
+def test_assignment_cannot_blank_a_validated_limb(tmp_path):
+    # Asserted as observed on the pinned pydantic: a frozen model refuses the
+    # assignment with pydantic's own ValidationError (error type
+    # "frozen_instance"), which is a ValueError subclass and NOT a TypeError.
+    # The limb is left untouched, so the failed mutation never reached the
+    # indexer and nothing could be persisted by it.
+    indexer = _indexer(tmp_path)
+    request = _request()
+    assert request.study_id == LIMBS["study_id"]
+
+    with pytest.raises(ValidationError) as excinfo:
+        request.study_id = None
+    assert excinfo.value.errors()[0]["type"] == "frozen_instance"
+    assert "study_id" in str(excinfo.value)
+    assert not isinstance(excinfo.value, TypeError), "pydantic raises ValidationError, not TypeError"
+
+    # The request survived the attempt intact, so it is still usable ...
+    assert request.study_id == LIMBS["study_id"]
+    assert request.missing_fields() == []
+    # ... and the failed attempt persisted nothing.
+    assert indexer.get_collection_count() == 0
+
+
+def test_a_blanked_limb_would_still_be_refused_by_the_funnel(tmp_path):
+    # Defence in depth for the "either way" guarantee: even if a future pydantic
+    # stopped refusing the assignment, the presence re-check in to_base_metadata()
+    # still refuses the blanked limb, so no chunk can be minted from it.
+    indexer = _indexer(tmp_path)
+    blanked = IndexDocumentRequest.model_construct(**{**_fields(), "study_id": None})
+    assert blanked.study_id is None
+    with pytest.raises(IdentityMissingError) as excinfo:
+        indexer.index_markdown(DOC, request=blanked)
+    assert excinfo.value.missing == ["study_id"]
+    assert indexer.get_collection_count() == 0
+
+
+def test_to_base_metadata_never_stringifies_a_missing_limb():
+    # The specific corruption the re-check exists to stop: str(None) == "None",
+    # which would then be minted into a contract-shaped chunk id binding a
+    # chunk to a study that was never named.  to_base_metadata must raise.
+    forged = IndexDocumentRequest.model_construct(
+        **{
+            **_fields(),
+            "workspace_id": None,
+            "study_id": None,
+            "document_id": None,
+            "parent_artifact_id": None,
+            "parent_artifact_sha256": None,
+            "extracted_content_sha256": None,
+        }
+    )
+    with pytest.raises(IdentityMissingError) as excinfo:
+        forged.to_base_metadata()
+    assert excinfo.value.missing == list(IDENTITY_LIMB_KEYS)
+    # A complete request still returns plain strings, so the refusal is about
+    # presence and not about the return type.
+    assert all(isinstance(value, str) for value in _request().to_base_metadata().values())
+
+
+def test_validated_request_is_immutable():
+    # frozen=True is what backs the assertion in the test above; pin it directly.
+    request = _request()
+    with pytest.raises(ValidationError):
+        request.collection = "somewhere_else"
+    assert request.collection == COLLECTION
+    with pytest.raises(ValidationError):
+        del request.study_id
+    assert request.study_id == LIMBS["study_id"]
+
+
+# --------------------------------------------------------------------------
+# (h) pydantic keeps ownership of type violations (never the typed error)
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("bad_value", [12345, 3.5, ["a"], {"k": "v"}, object()])
+def test_a_type_violation_is_a_pydantic_error_not_the_typed_error(bad_value):
+    # The split: absence is ours (IdentityMissingError, naming the field), but a
+    # *wrong type* is pydantic's ValidationError.  Pinned because pydantic v2
+    # does not coerce int/float/list/object to str, so this is a real refusal
+    # rather than a silent "12345" becoming an identity.
+    with pytest.raises(ValidationError) as excinfo:
+        IndexDocumentRequest(**_fields(workspace_id=bad_value))
+    assert not isinstance(excinfo.value, IdentityMissingError)
+    assert any(err["loc"] == ("workspace_id",) for err in excinfo.value.errors())
+
+
+def test_a_type_violation_in_a_limb_is_not_converted_to_a_string():
+    with pytest.raises(ValidationError):
+        IndexDocumentRequest(**_fields(parent_artifact_sha256=12345))

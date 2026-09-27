@@ -30,7 +30,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, PrivateAttr
 
 from scholar_rag.chunker import IDENTITY_LIMB_KEYS, _present
 
@@ -79,6 +79,29 @@ class IdentityMissingError(IndexRequestError):
         )
 
 
+class WorkspaceManifestUnreadableError(IndexRequestError):
+    """The recorded workspace manifest could not be read or interpreted.
+
+    Deliberately distinct from :class:`IdentityMissingError`: no *field* is
+    missing here, the manifest channel itself is unusable.  Keeping ``.missing``
+    reserved for a list of field names (field-level cases only) is what lets a
+    caller tell "this record is incomplete" from "this record cannot be read",
+    instead of reporting a file-level failure as a missing field.
+    """
+
+    code = "WORKSPACE_MANIFEST_UNREADABLE"
+
+    def __init__(self, path: Any, reason: str) -> None:
+        self.path = str(path)
+        self.reason = reason
+        super().__init__(
+            f"index request refuses to inherit identity: the recorded workspace manifest at "
+            f"{self.path} is unusable: {reason}. Supply the manifest as a readable JSON object, or "
+            "pass typed request fields (scholar_rag.index_models.IndexDocumentRequest). No identity "
+            "is inferred when the recorded manifest cannot be read."
+        )
+
+
 class BackendIdentityMismatchError(IndexRequestError):
     """The stated backend disagrees with the bound indexer's embedder.
 
@@ -122,9 +145,21 @@ class IndexDocumentRequest(BaseModel):
     silently dropped value.  All required fields default to ``None`` so that
     presence is decided by :class:`IdentityMissingError` (which names the
     fields) instead of by pydantic's generic missing-field error.
+
+    ``frozen=True`` closes the post-construction mutation hole: a validated
+    request cannot have a limb blanked out after the fact.  Frozen is *not* the
+    whole defence on its own, because :meth:`pydantic.BaseModel.model_construct`
+    bypasses ``__init__`` entirely and so bypasses the presence check below -
+    :meth:`to_base_metadata` re-checks presence itself, which is what makes both
+    indexing entry points funnel through a refusing channel.
     """
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    #: Scope used to name the document in a refusal raised after construction.
+    #: A private attribute, not a field: it is not part of the request's data
+    #: and must not appear in a dump or count towards the closed field set.
+    _scope: str = PrivateAttr(default=DEFAULT_SCOPE)
 
     # --- the six chunk-identity limbs (handoff 5.1, frozen by T-20) ---
     workspace_id: str | None = None
@@ -144,15 +179,26 @@ class IndexDocumentRequest(BaseModel):
         missing = self.missing_fields()
         if missing:
             raise IdentityMissingError(scope, missing)
+        # Recorded only once the object is known to be complete.  A forged
+        # object built with model_construct never reaches this line and falls
+        # back to DEFAULT_SCOPE in _resolution_scope().
+        self._scope = scope
+
+    def _resolution_scope(self) -> str:
+        """Scope to name in a refusal, tolerating an incompletely built object."""
+
+        return getattr(self, "_scope", DEFAULT_SCOPE) or DEFAULT_SCOPE
 
     def missing_fields(self) -> list[str]:
         """Required fields that are absent, ``None`` or whitespace-only.
 
         Mirrors the chunker's ``_present`` semantics exactly, so ``"0"`` counts
-        as supplied and only blank/``None`` values are refused.
+        as supplied and only blank/``None`` values are refused.  ``getattr`` has
+        a default so a field omitted by ``model_construct`` reads as absent
+        rather than raising ``AttributeError``.
         """
 
-        return [name for name in REQUIRED_REQUEST_FIELDS if not _present(getattr(self, name))]
+        return [name for name in REQUIRED_REQUEST_FIELDS if not _present(getattr(self, name, None))]
 
     def to_base_metadata(self) -> dict[str, str]:
         """Exactly the six identity limbs, for the chunker's metadata channel.
@@ -160,8 +206,19 @@ class IndexDocumentRequest(BaseModel):
         The request is authoritative: callers merge this *over* any
         ``base_metadata`` so a request can never be overridden by a stale or
         fabricated metadata value.
+
+        Presence is re-checked here, not only in ``__init__``, because this is
+        the single choke point both entry paths (``index_markdown`` and
+        ``index_directory``) pass through before a chunk can be minted.  Without
+        the re-check a request that skipped ``__init__`` would have its absent
+        limbs ``str()``-ed into the literal text ``"None"`` and minted into a
+        contract-shaped chunk id, binding a chunk to a study that was never
+        named.  Stringifying a missing value is never acceptable, so this raises.
         """
 
+        missing = self.missing_fields()
+        if missing:
+            raise IdentityMissingError(self._resolution_scope(), missing)
         return {name: str(getattr(self, name)) for name in IDENTITY_LIMB_KEYS}
 
     @classmethod

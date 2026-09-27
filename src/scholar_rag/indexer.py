@@ -18,6 +18,7 @@ from scholar_rag.index_models import (
     CollectionMismatchError,
     IdentityMissingError,
     IndexDocumentRequest,
+    WorkspaceManifestUnreadableError,
 )
 from scholar_rag.models import Chunk
 
@@ -214,25 +215,33 @@ class ScholarIndexer:
             pass
 
     def _read_workspace_manifest(self, workspace_manifest: dict[str, Any] | Path | str) -> dict[str, Any]:
-        """Read the recorded workspace manifest: a mapping, or a path to its JSON file."""
+        """Read the recorded workspace manifest: a mapping, or a path to its JSON file.
+
+        A file-level failure raises ``WorkspaceManifestUnreadableError``, not
+        ``IdentityMissingError``: the manifest channel is unusable rather than a
+        field being absent, and ``IdentityMissingError.missing`` stays reserved
+        for lists of field names.
+        """
         if isinstance(workspace_manifest, Mapping):
             return dict(workspace_manifest)
         path = Path(workspace_manifest)
         if not path.exists():
-            raise IdentityMissingError(
-                str(path),
-                ["workspace manifest file not found: " + str(path)],
-            )
+            raise WorkspaceManifestUnreadableError(path, "the manifest file was not found")
         try:
             with open(path, "r", encoding="utf-8") as handle:
                 loaded = json.load(handle)
-        except (OSError, ValueError) as exc:
-            raise IdentityMissingError(
-                str(path),
-                [f"workspace manifest is not readable JSON ({exc.__class__.__name__})"],
+        except json.JSONDecodeError as exc:
+            raise WorkspaceManifestUnreadableError(
+                path, f"the manifest is not valid JSON (line {exc.lineno}, column {exc.colno})"
+            ) from exc
+        except OSError as exc:
+            raise WorkspaceManifestUnreadableError(
+                path, f"the manifest could not be read ({exc.__class__.__name__})"
             ) from exc
         if not isinstance(loaded, dict):
-            raise IdentityMissingError(str(path), ["workspace manifest is not a JSON object"])
+            raise WorkspaceManifestUnreadableError(
+                path, f"the manifest JSON root is {type(loaded).__name__}, not an object"
+            )
         return loaded
 
     def _resolve_directory_request(
