@@ -248,9 +248,13 @@ _RFC3339_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}(?:\.\d+)
 #: A bounded static check on every string this module persists or returns.  The
 #: intent and the lock carry no free-text field at all, so there is nowhere for a
 #: secret to be placed; what *can* reach them is a path, and a path is refused.
-_ABSOLUTE_PATH_PATTERN = re.compile(r"^(?:[A-Za-z]:[\\/]|[\\/]{1,2})")
+#: The drive-relative forms count: ``C:notes\draft.md`` and a bare ``C:`` resolve
+#: against the *current* drive and working directory, so they are machine-local
+#: exactly as ``C:\...`` is, and requiring a separator after the colon would let
+#: both through while claiming the guard refuses absolute paths.
+_ABSOLUTE_PATH_PATTERN = re.compile(r"^(?:[A-Za-z]:|[\\/]{1,2})")
 _EMBEDDED_ABSOLUTE_PATH_PATTERN = re.compile(
-    r"(?<![A-Za-z0-9_])[A-Za-z]:[\\/]"
+    r"(?<![A-Za-z0-9_])[A-Za-z]:"
     r"|(?<![\\\w])\\\\[A-Za-z0-9._-]+"
     r"|(?:^|(?<=[\s'\"(\[]))/(?:[\w.-]{2,}/)+"
 )
@@ -1888,8 +1892,14 @@ class IndexReplacement:
         """
 
         records = list(request.chunks)
-        self._mutate("stage", request, lambda: self._backend.stage(request.run_id, records))
+        # Recorded *before* the write, not after.  ``staging_intact`` answers
+        # "is this run's staging area still present for 7.5 recovery", and a
+        # backend that wrote half the rows and then raised left rows that are
+        # physically there -- inert and generation-scoped, but addressable by
+        # the recovery run.  Recording only on success would report that
+        # in-flight abort as an empty workspace and lose the handle on it.
         self._staged_runs.add(request.run_id)
+        self._mutate("stage", request, lambda: self._backend.stage(request.run_id, records))
         reported = self._read_staged(request, request.run_id)
         stored: dict[str, StagedRow] = {}
         for row in reported:

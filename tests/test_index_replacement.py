@@ -290,6 +290,9 @@ class FakeBackend(ReplacementBackend):
     def __init__(self) -> None:
         self.rows: dict[str, dict[str, StagedRow]] = {}
         self.pointer: frozenset[str] = frozenset()
+        #: The generation the visibility switch last published, mirroring the
+        #: collection-metadata marker ``ChromaReplacementView`` switches on.
+        self.generation: str | None = None
         self.staged: dict[str, dict[str, StagedRow]] = {}
         self.switches: list[tuple[str, tuple[str, ...]]] = []
         self.removals: list[tuple[str, ...]] = []
@@ -344,17 +347,25 @@ class FakeBackend(ReplacementBackend):
             raise RuntimeError("incomplete staging")
         self.switches.append((run_id, tuple(chunk_ids)))
         self.pointer = frozenset(chunk_ids)
+        self.generation = run_id
 
     def remove_obsolete(self, document_ids: Sequence[str], keep_ids: Sequence[str]) -> int:
         self.calls.append("remove_obsolete")
         if self.fail_on == "remove_obsolete":
             raise RuntimeError("obsolete removal failure")
         self.removals.append(tuple(document_ids))
+        documents = set(document_ids)
         keep = set(keep_ids)
         removed = 0
-        for rows in self.staged.values():
+        for generation, rows in self.staged.items():
             for chunk_id, row in list(rows.items()):
-                if row.document_id in set(document_ids) and chunk_id not in keep:
+                # Both halves of the Chroma view's rule, so a test run against
+                # this fake and against a real collection state the same truth:
+                # a scoped document's row survives only if it is in the *current*
+                # generation AND kept. Filtering on ``keep`` alone would leave the
+                # superseded generation's row of a still-kept identity behind.
+                stale_generation = generation != self.generation
+                if row.document_id in documents and (stale_generation or chunk_id not in keep):
                     del rows[chunk_id]
                     removed += 1
         return removed
@@ -587,7 +598,10 @@ def test_e3_pos_006_a_shortened_document_leaves_no_old_chunk_retrievable(protoco
     assert not any(dropped <= set(rows) for rows in backend.staged.values()), (
         "R6 reclaimed the superseded rows, not just the pointer entry"
     )
-    assert second.removed_obsolete_chunks == 1
+    # Two rows, and the same two the Chroma view reports: the dropped
+    # identity's row, plus the superseded generation's row for the identity the
+    # candidate still keeps. Both backends state this one shared truth.
+    assert second.removed_obsolete_chunks == 2
     verification = protocol.verify_live_set(candidate)
     assert verification.matches is True
     assert verification.unexpected_chunk_ids == ()
@@ -645,23 +659,33 @@ def test_e3_pos_006_a_concurrent_reader_never_sees_a_mixture(protocol, backend):
     done = threading.Event()
 
     def reader() -> None:
+        reading.set()
         while not done.is_set():
             observations.append(frozenset(backend.visible_ids()))
-        reading.set()
 
     thread = threading.Thread(target=reader, daemon=True)
     thread.start()
-    try:
+    # Bounded: if the reader never straddles the switch, retry rather than pass
+    # a test that only ever saw one shape. Without this, a fast reader that only
+    # ever saw ``new`` would satisfy "never a mixture" without having observed
+    # the transition at all.
+    for _ in range(50):
+        if old in observations and new in observations:
+            break
+        del observations[:]
+        done.clear()
         protocol.run(request_for(candidate, accepted=accepted))
-    finally:
         done.set()
-        thread.join(timeout=10)
-    assert reading.wait(timeout=10)
+    finally_done = done.set()
+    del finally_done
+    thread.join(timeout=10)
     assert thread.is_alive() is False
 
     assert observations, "the reader observed nothing, so it proved nothing"
     for observed in observations:
         assert observed in (old, new), f"a reader saw a mixture: {sorted(observed)}"
+    assert old in observations, "the reader never observed the pre-switch set, so it did not straddle R5"
+    assert new in observations, "the reader never observed the post-switch set, so it did not straddle R5"
 
 
 def test_e3_pos_006_a_reader_never_sees_the_superset_left_by_a_crash_between_r5_and_r6(protocol, backend):
@@ -928,6 +952,67 @@ def test_e3_neg_044_an_interrupted_staging_write_publishes_nothing(protocol, bac
     assert set(backend.visible_ids()) == before
     assert backend.switches == []
     assert error.result.intent_path is None, "R4 has not run, so there is no intent to leave behind"
+
+
+def test_e3_neg_044_a_mid_write_abort_reports_its_staging_as_intact(protocol, backend, workspace):
+    """F2: ``staging_intact`` means "still present for 7.5", not "the write returned".
+
+    A backend that wrote half the rows and then raised left rows that are
+    physically there -- inert and generation-scoped, but addressable by the
+    recovery run that owns the commit intent. Recording the run only after
+    ``stage`` returned would report that abort as an empty workspace and lose
+    the handle on rows already written.
+    """
+
+    accepted = payload()
+    protocol.run(request_for(accepted))
+    candidate = shortened_candidate()
+
+    class HalfWritten(FakeBackend):
+        """Writes the first row, then aborts, exactly as a lost connection would.
+
+        Constructed over the *existing* store, so the live set the abort must
+        not disturb is the one this backend already publishes.
+        """
+
+        def __init__(self, live: FakeBackend) -> None:
+            super().__init__()
+            self.staged = {generation: dict(rows) for generation, rows in live.staged.items()}
+            self.pointer = live.pointer
+            self.generation = live.generation
+
+        def stage(self, run_id, records):  # noqa: ANN001, ANN202 - test double
+            self.calls.append("stage")
+            self.staged[run_id] = {
+                record.chunk_id: StagedRow(
+                    row_key=f"{run_id}#{record.chunk_id}",
+                    chunk_id=record.chunk_id,
+                    document_id=record.document_id,
+                    embedding_dimension=None,
+                )
+                for record in records[:1]
+            }
+            raise RuntimeError("provider dropped the connection mid-write")
+
+    half = HalfWritten(backend)
+    protocol._backend = half  # type: ignore[attr-defined]
+    before = set(half.visible_ids())
+    assert before, "the store must already hold a live set for this to be a test"
+
+    error = refuse(
+        lambda: protocol.run(request_for(candidate, accepted=accepted)),
+        AtomicCommitError,
+        "ATOMIC_COMMIT_FAILED",
+        stage="R2",
+    )
+    assert error.result.staging_intact is True, "the rows a recovery run would address are still there"
+    survivors = [row.chunk_id for row in half.staged_rows(candidate["run_id"])]
+    assert survivors == [candidate["visible_chunks"][0]["chunk_id"]], "and they are addressable by run"
+    assert half.switches == [], "an aborted write never switches visibility"
+    assert error.result.intent_path is None
+    assert not list((workspace / INDEX_DIR).glob(f"{candidate['run_id']}/*.json"))
+    assert set(half.visible_ids()) == before, "the previously live set is untouched"
+    assert not (workspace / INDEX_DIR / LOCK_FILENAME).exists()
 
 
 def test_e3_neg_044_a_partial_staging_write_is_refused_before_the_switch(protocol, backend):
@@ -1356,20 +1441,34 @@ def test_e3_neg_052_an_orphaned_lock_is_refused_exactly_like_a_live_holder(proto
 
 
 def test_two_runs_on_one_workspace_are_mutually_exclusive(protocol, backend, workspace):
-    """A real interleaving, not a hand-placed lock: exactly one run may proceed."""
+    """A real interleaving, not a hand-placed lock: never two runs inside at once.
+
+    The scheduler decides whether the two threads actually overlap, so the test
+    does not assert *which* outcome the loser got -- a thread that arrives after
+    the winner released the lock may legitimately replace again. What 7.4
+    guarantees, and what is asserted here, is that no run ever observed another
+    run's half-finished state: the lock serialises them, so every refusal is
+    ``CONFLICT`` and the workspace ends in one consistent index.
+    """
 
     manifest = payload()
     outcomes: list[str] = []
     errors: list[ReplacementError] = []
+    guard = threading.Lock()
     start = threading.Barrier(2)
 
     def attempt() -> None:
         start.wait(timeout=10)
         try:
-            outcomes.append(protocol.run(request_for(manifest)).outcome)
+            result = protocol.run(request_for(manifest))
         except ReplacementError as error:  # noqa: PERF203 - the point is to record the refusal
-            errors.append(error)
-            outcomes.append("REFUSED")
+            with guard:
+                errors.append(error)
+                outcomes.append("REFUSED")
+            return
+        with guard:
+            outcomes.append(result.outcome)
+        del result
 
     threads = [threading.Thread(target=attempt) for _ in range(2)]
     for thread in threads:
@@ -1377,16 +1476,18 @@ def test_two_runs_on_one_workspace_are_mutually_exclusive(protocol, backend, wor
     for thread in threads:
         thread.join(timeout=30)
 
-    # Exactly one publication can happen: the loser of the lock is refused, and a
-    # thread that arrives *after* the winner released the lock re-runs the same
-    # manifest and therefore reuses it rather than replacing a second time.
-    assert outcomes.count("REPLACED") == 1, f"one visibility switch per run, got {outcomes}"
+    for thread in threads:
+        assert not thread.is_alive(), "a refused lock must not leave a thread waiting"
+    assert len(outcomes) == 2
+    assert set(outcomes) <= {"REPLACED", "REUSED", "REFUSED"}, outcomes
     for error in errors:
         assert error.code == "CONFLICT"
         assert error.result is not None and error.result.outcome == "REFUSED"
-    assert set(outcomes) in ({"REPLACED", "REFUSED"}, {"REPLACED", "REUSED"}), outcomes
+    assert len(errors) <= 1, "the lock admits one run at a time, so at most one loser"
+    assert backend.generation == manifest["run_id"], "the workspace ends on one generation"
+    assert set(backend.visible_ids()) == {chunk["chunk_id"] for chunk in manifest["visible_chunks"]}
+    assert len(backend.switches) == outcomes.count("REPLACED"), "each publication switched exactly once"
     assert not (workspace / INDEX_DIR / LOCK_FILENAME).exists(), "the lock is released by both paths"
-    del backend
 
 
 # ---------------------------------------------------------------------------
@@ -1486,13 +1587,35 @@ def test_r1_a_chunk_set_naming_an_undocumented_document_is_refused(protocol, bac
     assert backend.calls == []
 
 
-def test_a_request_carrying_an_absolute_path_is_refused_at_construction(protocol):
+@pytest.mark.parametrize(
+    "value",
+    [
+        "C:/absolute/path.md",
+        "C:\\absolute\\path.md",
+        "C:rel",
+        "C:",
+        "\\\\server\\share\\path.md",
+        "/etc/passwd",
+        "..\\outside\\path.md",
+    ],
+    ids=["posix", "windows", "drive-relative", "bare-drive", "unc", "posix-rooted", "traversal"],
+)
+def test_a_request_carrying_a_path_shaped_value_is_refused_at_construction(protocol, value):
+    """F1: every path shape the guard claims to refuse, including drive-relative.
+
+    ``C:rel`` and a bare ``C:`` resolve against the current drive and working
+    directory, so they are machine-local exactly as ``C:\\...`` is. A guard whose
+    patterns required a separator after the colon refused the rooted forms and
+    documented the others as covered.
+    """
+
     manifest = payload()
-    manifest["documents"][0]["extracted_path"] = str(Path("C:/absolute/path.md"))
+    manifest["documents"][0]["extracted_path"] = value
     refuse(
         lambda: request_for(manifest),
         ReplacementError,
         "VALIDATION_ERROR",
+        field="manifest.documents.0.extracted_path",
         travels_back=False,
     )
 
@@ -1676,6 +1799,46 @@ def test_e3_pos_006_the_chroma_marker_switch_leaves_no_mixture(chroma_backend, t
     stored = {str(metadata["chunk_id"]) for metadata in rows["metadatas"]}
     assert stored == {chunk["chunk_id"] for chunk in candidate["visible_chunks"]}, "R6 reclaimed the superseded row"
     assert chroma_backend.remove_obsolete([DOCUMENT], [chunk["chunk_id"] for chunk in candidate["visible_chunks"]]) == 0
+
+
+def test_a_real_embedding_provider_raise_is_an_atomic_commit_failure(tmp_path: Path):
+    """F3: R3's provider failure, driven against a real collection.
+
+    The pointer fake raises a ``RuntimeError`` from a method body; this raises
+    from the *embedder* -- the call a real provider would fail on -- through the
+    real ``ChromaReplacementView``. C-21: a provider failure is an interrupted
+    operation, so it is ``ATOMIC_COMMIT_FAILED``, not a partial success and not a
+    state inconsistency.
+    """
+
+    pytest.importorskip("chromadb")
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    view = ChromaReplacementView(db_path=tmp_path / "chroma", collection_name=COLLECTION, embedder=embedder)
+    protocol = IndexReplacement(workspace_root=workspace, backend=view, embedder=embedder)
+
+    calls: list[int] = []
+
+    def failing_embedder(texts: Sequence[str]) -> Sequence[Sequence[float]]:
+        calls.append(1)
+        raise RuntimeError("embedding provider is unreachable")
+
+    protocol._embedder = failing_embedder  # type: ignore[attr-defined]
+    manifest = payload()
+
+    error = refuse(
+        lambda: protocol.run(request_for(manifest)),
+        AtomicCommitError,
+        "ATOMIC_COMMIT_FAILED",
+        stage="R3",
+    )
+    assert calls == [1], "the provider is called once, and its failure is not retried into a partial write"
+    assert error.result.staging_intact is True, "the staged rows are addressable for a 7.5 recovery run"
+    assert error.result.intent_path is None, "R4 has not run, so there is no intent to act on"
+    assert error.result.sidecar_path is None
+    assert not list((workspace / INDEX_DIR).glob(f"{manifest['run_id']}/*.json"))
+    assert view.visible_ids() == [], "an interrupted first run never published a live set"
+    assert not (workspace / INDEX_DIR / LOCK_FILENAME).exists(), "the lock is released on the refusal path"
 
 
 def test_the_chroma_view_refuses_a_switch_it_does_not_implement(chroma_backend):
