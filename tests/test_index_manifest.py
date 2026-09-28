@@ -526,6 +526,40 @@ def test_pos_004_counts_equal_the_array_lengths():
     assert model.counts.visible_chunks == len(model.visible_chunks) == 3
 
 
+@pytest.mark.parametrize(
+    ("count_field", "wrong_value"),
+    [
+        ("accepted_documents", 1),
+        ("rejected_documents", 2),
+        ("visible_chunks", 4),
+    ],
+)
+def test_a_count_that_disagrees_with_its_array_is_refused(count_field: str, wrong_value: int):
+    """4.3 rule 2: a count is a claim a consumer reads without opening the sidecar.
+
+    The counterpart of the positive above, and deliberately the *only* shape that
+    can catch a deleted ``_check_counts``: every other count mutation in this file
+    changes a count **and** the array it describes, so the two still agree and the
+    rule is never the one that fires.  Here the arrays are untouched and one count
+    is made false, so the count rule is the only possible refusal.
+
+    No reseal, by design: ``_check_counts`` runs before ``_check_fingerprints`` in
+    ``from_payload``, so the plain mutation reaches rule 2 rather than being caught
+    earlier as a stale digest.  That ordering is the reason the test needs no
+    fingerprint work at all, and it is why the mutation is not masked.
+    """
+
+    payload = golden()
+    payload["counts"][count_field] = wrong_value
+    refuse(
+        lambda: IndexManifest.from_payload(payload),
+        ManifestValidationError,
+        "VALIDATION_ERROR",
+        field=f"counts.{count_field}",
+        mentions=(f"counts.{count_field}", "must be the array length"),
+    )
+
+
 def test_pos_004_the_inventory_and_the_per_document_lists_agree_exactly():
     model = IndexManifest.from_payload(golden())
     listed = [chunk_id for document in model.documents for chunk_id in document.chunk_ids]
@@ -1410,13 +1444,18 @@ def test_an_off_grammar_registered_identifier_is_refused(field: str, value: str)
     "value", ["IDX-748C4D3DD6CFC8133835092B36B7B4BC", "IDX-748c4d3dd6cfc8133835092b36b7b4b", "748c4d3dd6cfc813"]
 )
 def test_a_manifest_id_outside_the_local_grammar_is_refused(value: str):
+    # "must match" and "local grammar" are the two phrases that belong to the local
+    # ``^IDX-[0-9a-f]{32}$`` branch and to nothing else.  Without them this test also
+    # passes against the stage-G digest-mismatch refusal, which fires for the same
+    # field and the same code and names the same value, so it would not pin this
+    # rule at all.
     payload = {**golden(), "manifest_id": value}
     refuse(
         lambda: IndexManifest.from_payload(payload),
         ManifestValidationError,
         "VALIDATION_ERROR",
         field="manifest_id",
-        mentions=(value, "IDX-"),
+        mentions=(value, "IDX-", "must match", "local grammar"),
     )
 
 
@@ -1897,6 +1936,14 @@ def test_a_rejected_document_absent_from_the_accepted_parent_is_refused():
             "documents.0.extracted_path",
         ),
         ("extraction_method", "HEURISTIC", "documents.0.extraction_method"),
+        (
+            # One hex digit different from the parent's own value: the content
+            # digest is an agreement limb, so a run that reports different bytes
+            # for the same document is re-binding what the parent already bound.
+            "extracted_content_sha256",
+            "sha256:5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5c",
+            "documents.0.extracted_content_sha256",
+        ),
     ],
 )
 def test_a_document_may_not_re_bind_an_identity_the_parent_already_bound(field: str, value: str, expected: str):
