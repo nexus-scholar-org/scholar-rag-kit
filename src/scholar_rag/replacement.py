@@ -967,8 +967,12 @@ class ChromaReplacementView:
 
     The mechanic is one collection-level metadata key, ``visible_generation``.
     Staging writes rows that carry the new run id as their own generation marker;
-    R5 writes the new run id into the collection metadata, which Chroma merges as a
-    single key (so ``hnsw:space`` survives) and which is therefore one atomic step;
+    R5 moves that one key in the collection metadata, and Chroma's
+    ``modify(metadata=...)`` *replaces* that mapping wholesale rather than
+    merging into it, so the switch reads the existing mapping, carries every
+    other pre-existing key forward, and preserves the immutable
+    distance-function key ``hnsw:space`` by deliberately not re-sending it.  The
+    write is still one atomic step;
     every reader resolves the live set by filtering on the collection's current
     generation.  R6 then deletes the older rows of the affected documents.
 
