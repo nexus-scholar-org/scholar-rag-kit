@@ -27,6 +27,14 @@ which is why a migrated index contains no legacy identity.
 
 Two boundaries this module holds deliberately:
 
+* **Recovery mutates only under 7.4's workspace lock.** Restoring a pointer or
+  deleting rows is a visibility switch like any other, so a state that may mutate
+  the store takes the frozen :class:`~scholar_rag.replacement.WorkspaceLock` first
+  and is refused with ``CONFLICT`` while any holder exists. A lock left behind by a
+  crashed run is an orphan, and an orphan is refused the same way: this module never
+  reads a timestamp, never expires a lock file, and never decides that a holder is
+  gone. Only the two rows that provably mutate nothing -- no intent, and a state
+  matching no row -- are lock-free.
 * **The kit never writes the journal.** 6.1 G-9: ``audit/journal.jsonl`` and the
   acceptance registry belong to the adapter. So recovery *reports* the canonical
   event it needs (see :class:`RecoveryEvent`) and removes a commit intent only
@@ -67,9 +75,11 @@ from scholar_rag.replacement import (
     COMMIT_INTENT_FILENAME,
     INDEX_DIR,
     CommitIntent,
+    ConcurrencyConflictError,
     ReplacementBackend,
     ReplacementError,
     ReplacementRequest,
+    WorkspaceLock,
 )
 
 #: Sidecar constant, not a Contract-v1 ``ErrorCode`` (4.5, L579). Imported by
@@ -116,6 +126,13 @@ assert RECOVERY_STATES.isdisjoint(REFUSAL_CODE_VOCABULARY), "a decision is not a
 ACTION_REJECTED = "RAG_INDEX_REJECTED"
 ACTION_BUILT = "RAG_INDEX_BUILT"
 RECOVERY_ACTIONS: frozenset[str] = frozenset({ACTION_REJECTED, ACTION_BUILT})
+
+#: What recovery records as ``acquired_at`` in the 7.4 lock it takes. Recovery has
+#: no clock to read and must not invent one, and the field is informational: the
+#: only field a contending holder consults is ``run_id``. The literal says "a
+#: recovery run took this lock for the named run", which is precisely the claim
+#: the record can support.
+RECOVERY_LOCK_ACQUIRED_AT = "recovery"
 
 #: 7.6 signals. A store is legacy when it shows *any* of these.
 LEGACY_LOWERCASE_CHK_ID = "lowercase_chk_id"
@@ -221,6 +238,7 @@ class RecoveryDecision(BaseModel):
     row: str
     state: str
     code: str | None = None
+    failing_step: str | None = None
     reason: str
     intent_present: bool
     intent_removed: bool
@@ -383,6 +401,23 @@ class IndexRecovery:
         yet removed the previous generation, so those rows are still *stored*.
         Reading them is what makes the R5/R6 row reachable at all.
 
+        The live set is then asked only *whether the candidate is fully published*,
+        and it is asked nothing about residue:
+
+        * candidate published, previous generation still stored -> :data:`R5_TO_R6`
+        * candidate published, previous generation gone          -> :data:`R5_TO_CHECK_7`
+        * candidate only partly published                        -> :data:`R5_TO_CHECK_7`
+
+        and the last row splits in :meth:`recover` by another fact: a whole new
+        index rolls forward, anything else restores the old pointer or refuses.
+
+        A live set that merely *contains* the candidate does not prove residue,
+        because a completed R6 leaves exactly that state while a run that never
+        reached R6 leaves it too. Reading "candidate is a subset of the live set"
+        as a superset therefore files the spec's row-4a state under R5/R6 and
+        records a reason -- "crash between R5 and R6" -- that the evidence
+        contradicts, which the adapter then persists as provenance.
+
         Returns one of :data:`RECOVERY_ROWS`. Anything matching no row is
         :data:`UNREADABLE_STATE`, which :meth:`recover` refuses rather than guesses
         at -- 7.5 opens with "recovery never guesses".
@@ -395,19 +430,24 @@ class IndexRecovery:
         if facts.accepted_matches_candidate:
             return POST_CHECK_7
         visible = set(facts.visible)
-        candidate = set(facts.candidate)
         previous = set(facts.previous_visible or ())
-        # Rows the previous generation still physically holds, and the part of
-        # them the candidate does not supersede: the residue R6 would remove.
-        residue = set(facts.previous_stored) - candidate
+        # R6's whole job is to remove the previous generation's rows, so "R6 has
+        # not finished" is exactly "the previous generation still stores rows". The
+        # identities cannot say so on their own: 5.1's identities are not
+        # run-scoped, so re-indexing unchanged content mints the *same* ids, and the
+        # superseded rows are then indistinguishable from the candidate by id while
+        # still being a separate generation physically on disk. Subtracting the
+        # candidate would report "R6 is done" for a run that died inside it.
+        #
+        # The live set is asked exactly one question -- is the candidate fully
+        # published? -- and never anything about residue. A candidate that is only
+        # partly visible is not rolled forward whatever R6 was doing, because
+        # rolling it forward would make a partial index visible.
+        r6_unfinished = bool(facts.previous_stored) and set(facts.candidate).issubset(visible)
         if visible == previous:
             return PRE_R5
         if facts.candidate_stored:
-            # R5 moved the pointer, and the only question left is whether R6 got
-            # to run. Both "the live set is a clean superset" (pointer mechanics
-            # that report a whole generation) and "the live set is the candidate"
-            # (marker mechanics) are the same row when R6 has not run.
-            return R5_TO_R6 if (residue or candidate.issubset(visible)) else R5_TO_CHECK_7
+            return R5_TO_R6 if r6_unfinished else R5_TO_CHECK_7
         return UNREADABLE_STATE
 
     # -- acting ----------------------------------------------------------
@@ -459,6 +499,19 @@ class IndexRecovery:
         reports has been appended durably by the adapter. Until then the commit
         intent is left in place, because 7.3 says an intent is removed by a
         recovery run that also records why -- never silently deleted.
+
+        **7.4's workspace lock is honored before anything is mutated.** A recovery
+        that restores a pointer or deletes rows is a visibility switch like any
+        other, so it runs under the same exclusive lock, and it is *refused* with
+        ``CONFLICT`` while any holder exists. A lock left behind by a crashed run
+        is an orphan, and an orphan is refused the same way: this module never
+        reads a timestamp, never expires a lock file, and never decides on its own
+        that a holder is gone. Breaking an orphan belongs to an operator, not to
+        the code that is trying to clean up after one.
+
+        The two lock-free rows are the two that provably mutate nothing -- no
+        intent to act on, and a state that matches no row -- so neither takes a
+        lock and neither can lose a race it never entered.
         """
 
         facts = self.inspect(run_id, accepted=accepted)
@@ -477,6 +530,57 @@ class IndexRecovery:
             )
         if row == UNREADABLE_STATE:
             return self._refuse(facts, row, "the backend matches no 7.5 row; recovery never guesses")
+
+        lock = self._recovery_lock(facts)
+        try:
+            lock.acquire()
+        except ConcurrencyConflictError:
+            # Nothing below this point has run, so the store, the staging area and
+            # the intent are all exactly as they were found.
+            return self._refuse(
+                facts,
+                row,
+                (
+                    f"another holder has the workspace lock at {lock.relative_path}, so recovery cannot "
+                    "mutate the store; a lock left behind by a crashed run is an orphan and is refused the "
+                    "same way, because deciding an orphan's fate is an operator's call and not this module's"
+                ),
+                code="CONFLICT",
+                failing_step="R1",
+            )
+        try:
+            return self._recover_locked(facts, row, accepted=accepted, event_durable=event_durable, candidate=candidate)
+        finally:
+            lock.release()
+
+    def _recovery_lock(self, facts: RecoveryFacts) -> WorkspaceLock:
+        """The 7.4 lock recovery holds while it may mutate the store.
+
+        Named after the run being recovered, because that is the run a contending
+        holder needs to be told about, and after the workspace the intent itself
+        declares. Both facts come from the sealed intent rather than from a
+        parameter, so a lock cannot be taken on behalf of a workspace the run never
+        belonged to.
+        """
+
+        assert facts.intent is not None, "a lock is only taken for a row that has an intent"
+        return WorkspaceLock(
+            workspace_root=self._workspace_root,
+            workspace_id=facts.intent.workspace_id,
+            run_id=facts.run_id,
+            created_at=RECOVERY_LOCK_ACQUIRED_AT,
+        )
+
+    def _recover_locked(
+        self,
+        facts: RecoveryFacts,
+        row: str,
+        *,
+        accepted: Mapping[str, Any] | None,
+        event_durable: bool,
+        candidate: ReplacementRequest | None,
+    ) -> RecoveryDecision:
+        """Act on a decided row. The caller holds 7.4's lock."""
 
         if row == OWNERSHIP:
             discarded = self._discard_non_live(facts, keep=facts.visible)
@@ -536,8 +640,8 @@ class IndexRecovery:
                 row,
                 state=ROLLED_FORWARD,
                 reason=(
-                    "the backend is a recoverable superset on the new pointer, which is the crash between "
-                    "R5 and R6; R6 is re-run -- idempotently -- and the run rolls forward"
+                    "the previous generation is still physically stored behind the new pointer, so R6 had "
+                    "not finished removing it: R6 is re-run -- idempotently -- and the run rolls forward"
                 ),
                 action=ACTION_BUILT,
                 code=None,
@@ -548,15 +652,18 @@ class IndexRecovery:
             )
 
         # R5_TO_CHECK_7: the pointer moved but the accepted record never landed.
-        # The row has two halves, and which one applies is a *fact*, not a guess.
+        # The row has two halves, and which one applies is a *fact*, not a guess:
+        # R6 is already done (no residue), so the only question left is whether the
+        # new generation is whole.
         if set(facts.visible) == set(facts.candidate):
             return self._finish(
                 facts,
                 row,
                 state=ROLLED_FORWARD,
                 reason=(
-                    "the live set matches the candidate, so the interrupted run's new index is complete and "
-                    "rolls forward; the adapter still has to make its own publication durable"
+                    "the live set matches the candidate and the previous generation is already gone, so the "
+                    "interrupted run's new index is whole and rolls forward; the adapter still has to make "
+                    "its own publication durable"
                 ),
                 action=ACTION_BUILT,
                 code=None,
@@ -596,13 +703,22 @@ class IndexRecovery:
         mode = getattr(self._backend, "mode", "marker")
         return mode if mode in {"marker", "pointer"} else "marker"
 
-    def _refuse(self, facts: RecoveryFacts, row: str, reason: str) -> RecoveryDecision:
+    def _refuse(
+        self,
+        facts: RecoveryFacts,
+        row: str,
+        reason: str,
+        *,
+        code: str = "BACKEND_STATE_INCONSISTENT",
+        failing_step: str | None = None,
+    ) -> RecoveryDecision:
         return RecoveryDecision(
             run_id=facts.run_id,
             row=row,
             state=REFUSED,
-            code="BACKEND_STATE_INCONSISTENT",
+            code=code,
             reason=reason,
+            failing_step=failing_step,
             intent_present=facts.intent_present,
             intent_removed=False,
             staging_discarded=False,
@@ -659,6 +775,7 @@ class IndexRecovery:
             row=row,
             state=state,
             code=code,
+            failing_step=failing_step,
             reason=reason,
             intent_present=True,
             intent_removed=removed,
