@@ -850,7 +850,7 @@ def _index_dir_fingerprint(workspace: Path) -> dict[str, bytes]:
     return {str(path.relative_to(root)): path.read_bytes() for path in sorted(root.rglob("*")) if path.is_file()}
 
 
-def test_e3_pos_011_legacy_a_refused_commit_reports_nothing_written_and_the_refusal(
+def test_e3_pos_011_legacy_a_scripted_refusal_reports_unknown_write_effect_and_the_refusal(
     workspace: Path, store: FakeBackend
 ) -> None:
     """A refused migration must not be reported as a committed one.
@@ -874,10 +874,12 @@ def test_e3_pos_011_legacy_a_refused_commit_reports_nothing_written_and_the_refu
 
     plan = migrator.commit(request_for(payload(run_id=RUN_C, chunk_count=3), accepted=first))
 
-    assert plan.wrote_nothing is True, "a refused run wrote nothing, and must say so"
+    assert plan.wrote_nothing is None, "an R4 refusal without effect evidence must not invent a write claim"
     assert plan.replacement_outcome == "REFUSED"
     assert plan.replacement_codes == ("VALIDATION_ERROR",), "the refusal's code is carried, not flattened"
     assert plan.replacement_stage == "R4", "the refusal's failing step is carried"
+    assert plan.replacement_result is not None
+    assert plan.replacement_result.outcome == "REFUSED"
     assert plan.replacement_outcome in REPLACEMENT_OUTCOMES
     for code in plan.replacement_codes:
         assert code in REFUSAL_CODE_VOCABULARY, code
@@ -913,10 +915,11 @@ def test_e3_pos_011_legacy_a_raised_refusal_is_propagated_into_the_plan(workspac
 
     plan = migrator.commit(request_for(payload(run_id=RUN_C, chunk_count=3), accepted=first))
 
-    assert plan.wrote_nothing is True
+    assert plan.wrote_nothing is None
     assert plan.replacement_outcome == "REFUSED"
     assert plan.replacement_codes == ("ATOMIC_COMMIT_FAILED",)
     assert plan.replacement_stage == "R4"
+    assert plan.replacement_result is refusal.result
     assert _index_dir_fingerprint(workspace) == before_dir
 
 
@@ -941,6 +944,7 @@ def test_e3_pos_011_legacy_the_dry_run_reports_no_replacement_outcome(workspace:
     assert plan.replacement_outcome is None
     assert plan.replacement_codes == ()
     assert plan.replacement_stage is None
+    assert plan.replacement_result is None
     # And the defaults must be reachable only as defaults, not by a caller.
     with pytest.raises(Exception):
         LegacyMigrationPlan(
@@ -975,37 +979,50 @@ def test_e3_pos_011_legacy_an_unattributed_failure_propagates_unchanged(workspac
             migrator.commit(request_for(payload(run_id=RUN_C, chunk_count=3), accepted=None))
 
 
-def test_e3_pos_011_legacy_a_reused_commit_reports_nothing_written(workspace: Path, store: FakeBackend) -> None:
-    """A reused index is a no-op, and reporting it as a write would be false.
-
-    ``REUSED`` means 7.1 found the accepted index already current. Nothing was
-    written, so ``wrote_nothing`` must be ``True`` even though the commit path ran
-    and did not refuse.
-    """
+def test_e3_pos_011_legacy_a_real_reused_commit_reports_its_sidecar_write(workspace: Path, store: FakeBackend) -> None:
+    """REUSED avoids backend mutation but still writes a re-sealed sidecar."""
 
     first = published_first(workspace, store)
     before_ids = stored_ids(store)
     migrator = LegacyMigrator(
         workspace_root=workspace,
-        replacement=_ScriptedReplacement(
-            result=ReplacementResult(
-                outcome="REUSED",
-                run_id=RUN_C,
-                stage="R1",
-                counts=Counts(accepted_documents=1, rejected_documents=0, visible_chunks=2),
-                live_set_matches=True,
-            )
-        ),
+        replacement=protocol_for(workspace, store),
         reader=MappingReader(LEGACY_ROWS, LEGACY_METADATA),
     )
 
-    plan = migrator.commit(request_for(payload(run_id=RUN_C, chunk_count=3), accepted=first))
+    plan = migrator.commit(request_for(first, accepted=first))
 
-    assert plan.wrote_nothing is True, "a reused index is not a write"
+    assert plan.wrote_nothing is False, "REUSED writes the re-sealed sidecar"
     assert plan.replacement_outcome == "REUSED"
     assert plan.replacement_codes == ()
-    assert plan.replacement_stage == "R1"
+    assert plan.replacement_stage == "R7"
+    assert plan.replacement_result is not None
+    assert plan.replacement_result.sidecar_path is not None
     assert stored_ids(store) == before_ids
+
+
+def test_e3_pos_011_legacy_an_r5_refusal_reports_staging_and_intent_writes(workspace: Path, store: FakeBackend) -> None:
+    """A late refusal is not write-free merely because it did not publish."""
+
+    store.fail_on = "switch_visibility"
+    migrator = LegacyMigrator(
+        workspace_root=workspace,
+        replacement=protocol_for(workspace, store),
+        reader=MappingReader(LEGACY_ROWS, LEGACY_METADATA),
+    )
+    candidate = payload(run_id=RUN_C, chunk_count=2)
+
+    plan = migrator.commit(request_for(candidate, accepted=None))
+
+    assert plan.replacement_outcome == "REFUSED"
+    assert plan.replacement_stage == "R5"
+    assert plan.replacement_codes == ("ATOMIC_COMMIT_FAILED",)
+    assert plan.wrote_nothing is False
+    assert plan.replacement_result is not None
+    assert plan.replacement_result.staging_intact is True
+    assert plan.replacement_result.intent_path is not None
+    assert intent_path(workspace, RUN_C).exists()
+    assert len(store.staged[RUN_C]) == 2
 
 
 def test_e3_pos_011_legacy_a_current_store_is_not_legacy_and_may_be_indexed(

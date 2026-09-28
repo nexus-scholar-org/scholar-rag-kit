@@ -825,15 +825,16 @@ class LegacyMigrationPlan(BaseModel):
     7.6 limb 3: the dry run reports the proposed chunk set, the proposed
     ``index_fingerprint`` and every refused document, and writes nothing.
 
-    The last four fields are what the *commit* actually did, and they exist because
+    The last five fields are what the *commit* actually did, and they exist because
     the operator reading this plan has to be able to tell a migration that
     committed from one that did not:
 
     ``wrote_nothing``
-        ``True`` unless a replacement run really replaced something. A ``REUSED``
-        no-op and a refusal both report ``True``, because in both cases nothing was
-        written; only a ``REPLACED`` outcome reports ``False``. Set by a dry run and
-        by a refused or idempotent commit alike, so the field means one thing.
+        ``True`` only when the available evidence proves that no write occurred,
+        ``False`` when the replacement result proves at least one write occurred,
+        and ``None`` when a refused provider operation does not expose enough
+        evidence to decide.  In particular, ``REUSED`` writes a re-sealed sidecar,
+        and a refusal after R1 may leave staging or a commit intent behind.
     ``replacement_outcome``
         Which of 7.1's three outcomes the commit's run reported, or ``None`` when no
         replacement ran at all -- a dry run, or a plan built for reporting. Never a
@@ -849,6 +850,9 @@ class LegacyMigrationPlan(BaseModel):
         The 7.1 step the commit's run reached, or the step it failed at. ``None``
         when no replacement ran. A refusal names the step that refused, so this is
         what distinguishes a refusal before publication from one after.
+    ``replacement_result``
+        The complete closed 7.1 result, preserved so callers can inspect concrete
+        write evidence without reconstructing it from the flattened summary.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -860,10 +864,11 @@ class LegacyMigrationPlan(BaseModel):
     index_fingerprint: str
     proposed_manifest_id: str
     rejected_documents: tuple[dict[str, Any], ...] = ()
-    wrote_nothing: bool = True
+    wrote_nothing: bool | None = True
     replacement_outcome: str | None = None
     replacement_codes: tuple[str, ...] = ()
     replacement_stage: str | None = None
+    replacement_result: ReplacementResult | None = None
 
     @field_validator("replacement_outcome")
     @classmethod
@@ -1164,14 +1169,12 @@ class LegacyMigrator:
         --R7 order is exactly that. This method holds no row-editing handle, so
         "migrate by mutating historical rows" is not an operation it can perform.
 
-        The commit reports the outcome 7.1's run actually reported, and it derives
-        ``wrote_nothing`` from that outcome instead of asserting it. A run that
-        reused the accepted index wrote nothing, and a run that refused wrote
-        nothing, so both report ``wrote_nothing=True`` alongside their own outcome,
-        codes and stage; only a run that really replaced something reports
-        ``False``. Assuming success would let a refused migration reach the
-        operator as a committed one, which is the one thing a migration report must
-        never do.
+        The commit reports the complete result 7.1 actually produced.  Write effects
+        are not inferred from the outcome: ``REUSED`` writes a sidecar, and a
+        ``REFUSED`` run may already have staged rows, written an intent, switched
+        visibility, or removed obsolete rows. ``wrote_nothing`` is therefore
+        three-valued: true when no write is proven, false when a write is observed,
+        and ``None`` when a provider refusal leaves the effect unknowable.
 
         The typed pre-publication refusal is caught rather than re-raised, because
         7.1 attaches a fully populated ``REFUSED`` result to it and that result is
@@ -1203,25 +1206,22 @@ class LegacyMigrator:
         report, not a silent success.
         """
 
-        if result.outcome == "REPLACED":
-            return plan.model_copy(
-                update={
-                    "wrote_nothing": False,
-                    "replacement_outcome": result.outcome,
-                    "replacement_codes": tuple(result.codes),
-                    "replacement_stage": result.stage,
-                }
+        if result.outcome in REPLACEMENT_OUTCOMES:
+            observed_write = bool(
+                result.outcome in {"REPLACED", "REUSED"}
+                or result.sidecar_path
+                or result.intent_path
+                or result.staging_intact
+                or result.removed_obsolete_chunks
             )
-        if result.outcome in {"REUSED", "REFUSED"}:
+            proved_write_free = result.outcome == "REFUSED" and result.stage == "R1" and not observed_write
             return plan.model_copy(
                 update={
-                    # Both wrote nothing. A reused index is a no-op and a refusal is
-                    # a no-op, and the reason each took that turn is carried beside
-                    # it rather than replacing it.
-                    "wrote_nothing": True,
+                    "wrote_nothing": False if observed_write else True if proved_write_free else None,
                     "replacement_outcome": result.outcome,
                     "replacement_codes": tuple(result.codes),
                     "replacement_stage": result.stage,
+                    "replacement_result": result,
                 }
             )
         raise AtomicCommitError(
