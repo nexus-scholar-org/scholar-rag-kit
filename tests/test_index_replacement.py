@@ -656,30 +656,39 @@ def test_e3_pos_006_a_concurrent_reader_never_sees_a_mixture(protocol, backend):
     assert new != old
 
     observations: list[frozenset[str]] = []
-    reading = threading.Event()
-    done = threading.Event()
+    observed_first = threading.Event()
+    stop = threading.Event()
 
     def reader() -> None:
-        reading.set()
-        while not done.is_set():
+        while not stop.is_set():
             observations.append(frozenset(backend.visible_ids()))
+            # Signalled only *after* a snapshot is taken, so the main thread
+            # cannot start a switch until this reader is genuinely inside the
+            # loop. A ``threading.Barrier`` would prove only that the thread was
+            # scheduled, not that it had observed the pre-switch set -- which is
+            # the whole point, and is what the old never-waited-on ``reading``
+            # event silently failed to establish.
+            observed_first.set()
 
     thread = threading.Thread(target=reader, daemon=True)
     thread.start()
-    # Bounded: if the reader never straddles the switch, retry rather than pass
-    # a test that only ever saw one shape. Without this, a fast reader that only
-    # ever saw ``new`` would satisfy "never a mixture" without having observed
-    # the transition at all.
-    for _ in range(50):
-        if old in observations and new in observations:
-            break
-        del observations[:]
-        done.clear()
-        protocol.run(request_for(candidate, accepted=accepted))
-        done.set()
-    finally_done = done.set()
-    del finally_done
-    thread.join(timeout=10)
+    try:
+        assert observed_first.wait(timeout=10), "the reader never observed the pre-switch set, so it cannot straddle R5"
+        # Bounded: if the reader never straddles the switch, retry rather than pass
+        # a test that only ever saw one shape. Without this, a fast reader that only
+        # ever saw ``new`` would satisfy "never a mixture" without having observed
+        # the transition at all. The reader is deliberately left running across
+        # iterations -- clearing a per-iteration stop flag could let it observe the
+        # flag as set and exit the loop, after which no iteration would have a
+        # reader left to observe anything.
+        for _ in range(50):
+            if old in observations and new in observations:
+                break
+            del observations[:]
+            protocol.run(request_for(candidate, accepted=accepted))
+    finally:
+        stop.set()
+        thread.join(timeout=10)
     assert thread.is_alive() is False
 
     assert observations, "the reader observed nothing, so it proved nothing"
