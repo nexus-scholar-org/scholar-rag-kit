@@ -60,7 +60,7 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from scholar_rag.canonical import canonical_json_bytes
 from scholar_rag.index_manifest import (
@@ -74,11 +74,15 @@ from scholar_rag.index_manifest import (
 from scholar_rag.replacement import (
     COMMIT_INTENT_FILENAME,
     INDEX_DIR,
+    REPLACEMENT_OUTCOMES,
+    AtomicCommitError,
     CommitIntent,
     ConcurrencyConflictError,
     ReplacementBackend,
     ReplacementError,
     ReplacementRequest,
+    ReplacementResult,
+    ReplacementValidationError,
     WorkspaceLock,
 )
 
@@ -820,6 +824,31 @@ class LegacyMigrationPlan(BaseModel):
 
     7.6 limb 3: the dry run reports the proposed chunk set, the proposed
     ``index_fingerprint`` and every refused document, and writes nothing.
+
+    The last four fields are what the *commit* actually did, and they exist because
+    the operator reading this plan has to be able to tell a migration that
+    committed from one that did not:
+
+    ``wrote_nothing``
+        ``True`` unless a replacement run really replaced something. A ``REUSED``
+        no-op and a refusal both report ``True``, because in both cases nothing was
+        written; only a ``REPLACED`` outcome reports ``False``. Set by a dry run and
+        by a refused or idempotent commit alike, so the field means one thing.
+    ``replacement_outcome``
+        Which of 7.1's three outcomes the commit's run reported, or ``None`` when no
+        replacement ran at all -- a dry run, or a plan built for reporting. Never a
+        free-text success claim: it is a member of
+        :data:`~scholar_rag.replacement.REPLACEMENT_OUTCOMES` or it is ``None``.
+    ``replacement_codes``
+        The frozen refusal codes the commit's run reported, in its own vocabulary
+        and in its own order. Empty for a success. This module mints none of them;
+        it only carries what the frozen run reported, so a refusal's reason survives
+        into the operator's report instead of being flattened into "nothing was
+        written".
+    ``replacement_stage``
+        The 7.1 step the commit's run reached, or the step it failed at. ``None``
+        when no replacement ran. A refusal names the step that refused, so this is
+        what distinguishes a refusal before publication from one after.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -832,6 +861,27 @@ class LegacyMigrationPlan(BaseModel):
     proposed_manifest_id: str
     rejected_documents: tuple[dict[str, Any], ...] = ()
     wrote_nothing: bool = True
+    replacement_outcome: str | None = None
+    replacement_codes: tuple[str, ...] = ()
+    replacement_stage: str | None = None
+
+    @field_validator("replacement_outcome")
+    @classmethod
+    def _outcome_is_a_member_or_nothing(cls, value: str | None) -> str | None:
+        """The outcome is one of 7.1's three, or absent -- never a free-text claim.
+
+        The default is ``None`` because ``None`` is the honest report for a dry run
+        and for any plan built without a replacement; anything else must be a member
+        of the frozen set, so a plan cannot assert a migration "mostly worked".
+        """
+
+        if value is not None and value not in REPLACEMENT_OUTCOMES:
+            raise ReplacementValidationError(
+                f"refuses to report replacement_outcome={value!r}: it is not one of "
+                f"{sorted(REPLACEMENT_OUTCOMES)}, and a plan may not name an outcome of its own invention",
+                field="replacement_outcome",
+            )
+        return value
 
 
 def classify_legacy_rows(
@@ -1113,11 +1163,75 @@ class LegacyMigrator:
         :class:`~scholar_rag.replacement.IndexReplacement` doing the work, whose R1
         --R7 order is exactly that. This method holds no row-editing handle, so
         "migrate by mutating historical rows" is not an operation it can perform.
+
+        The commit reports the outcome 7.1's run actually reported, and it derives
+        ``wrote_nothing`` from that outcome instead of asserting it. A run that
+        reused the accepted index wrote nothing, and a run that refused wrote
+        nothing, so both report ``wrote_nothing=True`` alongside their own outcome,
+        codes and stage; only a run that really replaced something reports
+        ``False``. Assuming success would let a refused migration reach the
+        operator as a committed one, which is the one thing a migration report must
+        never do.
+
+        The typed pre-publication refusal is caught rather than re-raised, because
+        7.1 attaches a fully populated ``REFUSED`` result to it and that result is
+        the refusal's own account of itself. Every other failure propagates
+        unchanged: an ``INTERNAL_ERROR`` is a defect in a view, a ``CONFLICT`` is
+        contention, and neither is a claim about what this migrator wrote, so
+        neither may be turned into a plan that makes one. A refusal that arrives
+        without a populated result is likewise re-raised untouched rather than
+        reported from an unattributed failure.
         """
 
         self.assess()
-        self._replacement.run(request)
-        return self.plan(request).model_copy(update={"wrote_nothing": False})
+        try:
+            result = self._replacement.run(request)
+        except AtomicCommitError as refusal:
+            attached = refusal.result
+            if attached is None or attached.outcome != "REFUSED":
+                # Nothing to attribute the failure to, so nothing to report.
+                raise
+            return self._with_replacement(self.plan(request), attached)
+        return self._with_replacement(self.plan(request), result)
+
+    def _with_replacement(self, plan: LegacyMigrationPlan, result: ReplacementResult) -> LegacyMigrationPlan:
+        """Map one replacement result onto the plan, explicitly and exhaustively.
+
+        Written as an explicit table rather than as "assume it worked" or even as
+        ``wrote_nothing=result.outcome != "REPLACED"``, because the field is the
+        operator's evidence and an unrecognized outcome must be a refusal to
+        report, not a silent success.
+        """
+
+        if result.outcome == "REPLACED":
+            return plan.model_copy(
+                update={
+                    "wrote_nothing": False,
+                    "replacement_outcome": result.outcome,
+                    "replacement_codes": tuple(result.codes),
+                    "replacement_stage": result.stage,
+                }
+            )
+        if result.outcome in {"REUSED", "REFUSED"}:
+            return plan.model_copy(
+                update={
+                    # Both wrote nothing. A reused index is a no-op and a refusal is
+                    # a no-op, and the reason each took that turn is carried beside
+                    # it rather than replacing it.
+                    "wrote_nothing": True,
+                    "replacement_outcome": result.outcome,
+                    "replacement_codes": tuple(result.codes),
+                    "replacement_stage": result.stage,
+                }
+            )
+        raise AtomicCommitError(
+            f"the replacement run reported outcome={result.outcome!r}, which is not one of "
+            f"{sorted(REPLACEMENT_OUTCOMES)}, so the migration cannot be reported at all: reporting it as a "
+            "success would be a free-text success claim, and reporting it as a refusal would attribute a "
+            "failure this module has not diagnosed. The frozen result model validates the outcome, so this "
+            "is a guard against a future widening rather than a reachable state",
+            field="replacement_outcome",
+        )
 
 
 def refuse_authoritative_use(assessment: LegacyAssessment, *, what: str) -> None:

@@ -55,6 +55,7 @@ from scholar_rag.recovery import (
     RECOVERY_ROWS,
     RECOVERY_STATES,
     IndexRecovery,
+    LegacyMigrationPlan,
     LegacyMigrator,
     LegacyStoreReader,
     LegacyStoreReadOnlyError,
@@ -66,8 +67,15 @@ from scholar_rag.replacement import (
     INDEX_DIR,
     LOCK_FILENAME,
     LOCK_SCHEMA_VERSION,
+    REPLACEMENT_OUTCOMES,
+    AtomicCommitError,
     ChromaReplacementView,
+    ConcurrencyConflictError,
+    Counts,
     IndexReplacement,
+    ReplacementInternalError,
+    ReplacementRequest,
+    ReplacementResult,
     WorkspaceLock,
 )
 
@@ -795,6 +803,211 @@ def test_recovery_writes_no_audit_journal_event(workspace: Path, store: FakeBack
 # ---------------------------------------------------------------------------
 
 
+def _refused_result(*, run_id: str = RUN_C, code: str = "VALIDATION_ERROR", stage: str = "R4") -> ReplacementResult:
+    """A real frozen ``REFUSED`` result: constructed, not faked.
+
+    Built by calling the model, so it passes the same semantic battery any run's
+    result does -- outcome in the closed set, codes from the closed vocabulary,
+    stage a real 7.1 step, and the zero counts 6.5 requires of a refusal.
+    """
+
+    return ReplacementResult(
+        outcome="REFUSED",
+        run_id=run_id,
+        stage=stage,
+        codes=(code,),
+        counts=Counts(accepted_documents=0, rejected_documents=0, visible_chunks=0),
+    )
+
+
+class _ScriptedReplacement:
+    """A replacement protocol that reports exactly what the test says it reports.
+
+    Its ``run`` either returns a result or raises the typed refusal 7.1 would have
+    raised, so both of a run's two ways of refusing are drivable without inventing
+    a protocol. It performs no I/O: the point of these tests is what the migrator
+    *reports* about a run it did not get a success from, and a fake that wrote
+    something would test the fake.
+    """
+
+    def __init__(self, *, result: ReplacementResult | None = None, raise_: BaseException | None = None) -> None:
+        self._result = result
+        self._raise = raise_
+
+    def run(self, request: ReplacementRequest) -> ReplacementResult:
+        if self._raise is not None:
+            raise self._raise
+        assert self._result is not None, "a scripted run must be told what to report"
+        return self._result
+
+
+def _index_dir_fingerprint(workspace: Path) -> dict[str, bytes]:
+    """Every byte under ``INDEX_DIR``, keyed by workspace-relative path."""
+
+    root = workspace / INDEX_DIR
+    if not root.exists():
+        return {}
+    return {str(path.relative_to(root)): path.read_bytes() for path in sorted(root.rglob("*")) if path.is_file()}
+
+
+def test_e3_pos_011_legacy_a_refused_commit_reports_nothing_written_and_the_refusal(
+    workspace: Path, store: FakeBackend
+) -> None:
+    """A refused migration must not be reported as a committed one.
+
+    This is the operator gate. The migrator used to discard the run's result and
+    assert ``wrote_nothing=False`` unconditionally, so a run that came back REFUSED
+    reached the operator as ``replacement_outcome=REFUSED,
+    reported_wrote_nothing=False`` -- a failed migration wearing a success flag.
+    The flag is now derived from the outcome, and the refusal's own codes and stage
+    travel with it so the operator learns *why* rather than only that.
+    """
+
+    first = published_first(workspace, store)
+    before_ids = stored_ids(store)
+    before_dir = _index_dir_fingerprint(workspace)
+    migrator = LegacyMigrator(
+        workspace_root=workspace,
+        replacement=_ScriptedReplacement(result=_refused_result(code="VALIDATION_ERROR", stage="R4")),
+        reader=MappingReader(LEGACY_ROWS, LEGACY_METADATA),
+    )
+
+    plan = migrator.commit(request_for(payload(run_id=RUN_C, chunk_count=3), accepted=first))
+
+    assert plan.wrote_nothing is True, "a refused run wrote nothing, and must say so"
+    assert plan.replacement_outcome == "REFUSED"
+    assert plan.replacement_codes == ("VALIDATION_ERROR",), "the refusal's code is carried, not flattened"
+    assert plan.replacement_stage == "R4", "the refusal's failing step is carried"
+    assert plan.replacement_outcome in REPLACEMENT_OUTCOMES
+    for code in plan.replacement_codes:
+        assert code in REFUSAL_CODE_VOCABULARY, code
+
+    # And the run really did write nothing, so the report is not merely a flag flip.
+    assert stored_ids(store) == before_ids
+    assert _index_dir_fingerprint(workspace) == before_dir, "INDEX_DIR is byte-identical: no sidecar, no intent"
+    assert not intent_path(workspace, RUN_C).exists()
+    assert not (workspace / "audit").exists(), "G-9: the kit writes no journal"
+
+
+def test_e3_pos_011_legacy_a_raised_refusal_is_propagated_into_the_plan(workspace: Path, store: FakeBackend) -> None:
+    """The typed refusal carries its own result, and the plan reports that result.
+
+    7.1's native refusal path raises rather than returns, attaching a fully
+    populated ``REFUSED`` result to the error. The migrator used to let that
+    exception escape while asserting success on the path that never ran, so the
+    two could not both be true. Here the typed refusal is caught and mapped
+    exactly as the returned case is, and the codes and stage survive.
+    """
+
+    first = published_first(workspace, store)
+    before_dir = _index_dir_fingerprint(workspace)
+    refusal = AtomicCommitError("simulated pre-publication failure")
+    refusal.run_id = RUN_C
+    refusal.stage = "R4"
+    refusal.result = _refused_result(code="ATOMIC_COMMIT_FAILED", stage="R4")
+    migrator = LegacyMigrator(
+        workspace_root=workspace,
+        replacement=_ScriptedReplacement(raise_=refusal),
+        reader=MappingReader(LEGACY_ROWS, LEGACY_METADATA),
+    )
+
+    plan = migrator.commit(request_for(payload(run_id=RUN_C, chunk_count=3), accepted=first))
+
+    assert plan.wrote_nothing is True
+    assert plan.replacement_outcome == "REFUSED"
+    assert plan.replacement_codes == ("ATOMIC_COMMIT_FAILED",)
+    assert plan.replacement_stage == "R4"
+    assert _index_dir_fingerprint(workspace) == before_dir
+
+
+def test_e3_pos_011_legacy_the_dry_run_reports_no_replacement_outcome(workspace: Path, store: FakeBackend) -> None:
+    """A dry run ran no replacement, and must not borrow another run's outcome.
+
+    The three new fields default to "nothing happened here". If a plan built without
+    a replacement inherited an outcome, a dry run would be reporting a commit
+    somebody else did.
+    """
+
+    first = published_first(workspace, store)
+    migrator = LegacyMigrator(
+        workspace_root=workspace,
+        replacement=protocol_for(workspace, store),
+        reader=MappingReader(LEGACY_ROWS, LEGACY_METADATA),
+    )
+
+    plan = migrator.plan(request_for(payload(run_id=RUN_C, chunk_count=3), accepted=first))
+
+    assert plan.wrote_nothing is True
+    assert plan.replacement_outcome is None
+    assert plan.replacement_codes == ()
+    assert plan.replacement_stage is None
+    # And the defaults must be reachable only as defaults, not by a caller.
+    with pytest.raises(Exception):
+        LegacyMigrationPlan(
+            run_id=RUN_C,
+            legacy=False,
+            index_fingerprint="sha256:" + "0" * 64,
+            proposed_manifest_id="manifest-" + "0" * 32,
+            replacement_outcome="MOSTLY_FINE",
+        )
+
+
+def test_e3_pos_011_legacy_an_unattributed_failure_propagates_unchanged(workspace: Path, store: FakeBackend) -> None:
+    """Not every thrown exception is a migration refusal, and none is a success.
+
+    A view that violates the contract, or a contended workspace, tells the migrator
+    nothing about what it wrote. Turning either into a plan would attach a claim
+    about writes to a failure this module has not diagnosed, so they propagate and
+    the operator sees the real error.
+    """
+
+    published_first(workspace, store)
+    for error in (
+        ReplacementInternalError("simulated view defect"),
+        ConcurrencyConflictError("simulated contention"),
+    ):
+        migrator = LegacyMigrator(
+            workspace_root=workspace,
+            replacement=_ScriptedReplacement(raise_=error),
+            reader=MappingReader(LEGACY_ROWS, LEGACY_METADATA),
+        )
+        with pytest.raises(type(error)):
+            migrator.commit(request_for(payload(run_id=RUN_C, chunk_count=3), accepted=None))
+
+
+def test_e3_pos_011_legacy_a_reused_commit_reports_nothing_written(workspace: Path, store: FakeBackend) -> None:
+    """A reused index is a no-op, and reporting it as a write would be false.
+
+    ``REUSED`` means 7.1 found the accepted index already current. Nothing was
+    written, so ``wrote_nothing`` must be ``True`` even though the commit path ran
+    and did not refuse.
+    """
+
+    first = published_first(workspace, store)
+    before_ids = stored_ids(store)
+    migrator = LegacyMigrator(
+        workspace_root=workspace,
+        replacement=_ScriptedReplacement(
+            result=ReplacementResult(
+                outcome="REUSED",
+                run_id=RUN_C,
+                stage="R1",
+                counts=Counts(accepted_documents=1, rejected_documents=0, visible_chunks=2),
+                live_set_matches=True,
+            )
+        ),
+        reader=MappingReader(LEGACY_ROWS, LEGACY_METADATA),
+    )
+
+    plan = migrator.commit(request_for(payload(run_id=RUN_C, chunk_count=3), accepted=first))
+
+    assert plan.wrote_nothing is True, "a reused index is not a write"
+    assert plan.replacement_outcome == "REUSED"
+    assert plan.replacement_codes == ()
+    assert plan.replacement_stage == "R1"
+    assert stored_ids(store) == before_ids
+
+
 def test_e3_pos_011_legacy_a_current_store_is_not_legacy_and_may_be_indexed(
     workspace: Path, store: FakeBackend
 ) -> None:
@@ -962,6 +1175,9 @@ def test_e3_pos_011_legacy_the_commit_reindexes_from_the_accepted_parent(workspa
     plan = migrator.commit(request_for(candidate, accepted=first))
 
     assert plan.wrote_nothing is False
+    assert plan.replacement_outcome == "REPLACED", "a real run that replaced something"
+    assert plan.replacement_codes == (), "a success carries no codes"
+    assert plan.replacement_stage is not None, "the step it reached is reported"
     # Manifest before commit: the sidecar and the intent are both on disk.
     assert list((workspace / INDEX_DIR / RUN_C).glob("*.json")), "the sidecar is written"
     assert intent_path(workspace, RUN_C).exists(), "the commit intent is written"
