@@ -38,6 +38,7 @@ from scholar_rag.index_manifest import (
     deterministic_projection,
 )
 from scholar_rag.replacement import (
+    _CHROMA_RESERVED_METADATA_KEYS,
     COMMIT_INTENT_FILENAME,
     COMMIT_INTENT_SCHEMA_VERSION,
     COMMIT_INTENT_TYPE,
@@ -1839,6 +1840,89 @@ def test_a_real_embedding_provider_raise_is_an_atomic_commit_failure(tmp_path: P
     assert not list((workspace / INDEX_DIR).glob(f"{manifest['run_id']}/*.json"))
     assert view.visible_ids() == [], "an interrupted first run never published a live set"
     assert not (workspace / INDEX_DIR / LOCK_FILENAME).exists(), "the lock is released on the refusal path"
+
+
+def test_the_chroma_visibility_switch_preserves_unrelated_collection_metadata(tmp_path: Path):
+    """Operator gate: R5 flips one marker and destroys nothing else.
+
+    Chroma's ``collection.modify(metadata=...)`` *replaces* the collection
+    metadata mapping rather than merging into it. Writing only
+    ``{"visible_generation": run_id}`` therefore silently discards
+    ``hnsw:space`` and every other key the collection carried -- including
+    metadata an operator or a legacy configuration put there, which the
+    protocol never wrote and so cannot restore. The switch must read, merge,
+    and write back.
+    """
+
+    chromadb = pytest.importorskip("chromadb")
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+
+    # Seeded directly so the collection carries metadata the view did not write:
+    # the ``hnsw:space`` the view sets, an operator's own key, a legacy marker,
+    # and non-string values to pin value *and* type fidelity, not just keys.
+    seeded: dict[str, Any] = {
+        "hnsw:space": "cosine",
+        "user_provided": "keep-me",
+        "schema_marker": "legacy-config",
+        "retention_days": 30,
+        "strict_mode": True,
+    }
+    view = ChromaReplacementView(db_path=tmp_path / "chroma", collection_name=COLLECTION, embedder=embedder)
+    # The view already seeded ``hnsw:space`` at creation, and ``modify`` refuses it
+    # back, so the operator's keys are added on their own.
+    view._collection.modify(metadata={key: value for key, value in seeded.items() if key != "hnsw:space"})
+
+    original = dict(view._collection.metadata or {})
+    # The distance function is seeded by the view at creation and is reported on
+    # read from the collection configuration rather than from the metadata the
+    # operator wrote; the operator's own keys are exactly what the ``modify``
+    # above added.
+    operator_keys = {key: value for key, value in seeded.items() if key != "hnsw:space"}
+    assert original == operator_keys, "the fixture must actually seed the collection"
+    assert view._collection.configuration.get("hnsw", {}).get("space") == "cosine", (
+        "the view seeds the distance function, which lives in the configuration"
+    )
+    # Every key the collection carried is unrelated to the marker, and the
+    # protocol never wrote any of them, so R5 discarding one would be a loss it
+    # could not repair. ``_CHROMA_RESERVED_METADATA_KEYS`` is the documented
+    # exception and is asserted empty for this fixture: nothing seeded here is a
+    # key Chroma would refuse back, so nothing is exempted from the guarantee.
+    assert _CHROMA_RESERVED_METADATA_KEYS.isdisjoint(original), "no seeded key is exempt from the merge"
+    unrelated = {key: value for key, value in original.items() if key != "visible_generation"}
+    assert len(unrelated) == 4, "every seeded key is unrelated to the marker"
+
+    protocol = IndexReplacement(workspace_root=workspace, backend=view, embedder=embedder)
+    accepted = payload()
+    first = protocol.run(request_for(accepted))
+    assert first.outcome == "REPLACED"
+    old_ids = {chunk["chunk_id"] for chunk in accepted["visible_chunks"]}
+
+    candidate = shortened_candidate()
+    second = protocol.run(request_for(candidate, accepted=accepted))
+    assert second.outcome == "REPLACED"
+    assert second.live_set_matches is True
+
+    after = dict(view._collection.metadata or {})
+    assert after["visible_generation"] == candidate["run_id"], "the marker moved"
+    assert view._visible_generation() == candidate["run_id"], "and the view's own read path agrees"
+    for key, value in unrelated.items():
+        assert key in after, f"R5 discarded the unrelated key {key!r}"
+        assert after[key] == value, f"R5 altered {key!r}"
+        assert type(after[key]) is type(value), f"R5 changed the value type of {key!r}"
+    assert {key: value for key, value in after.items() if key != "visible_generation"} == unrelated
+    assert set(after) == set(original) | {"visible_generation"}, "R5 added nothing and dropped nothing"
+    assert view._collection.configuration.get("hnsw", {}).get("space") == "cosine", (
+        "the distance function is immutable and lives in the configuration, so the switch cannot change it"
+    )
+
+    # The switch is still the whole of R5. The candidate reuses one identity, so
+    # the guarantee is that the *dropped* identity is unreachable and the live
+    # set is exactly the candidate's.
+    new_ids = {chunk["chunk_id"] for chunk in candidate["visible_chunks"]}
+    assert not set(view.visible_ids()) & (old_ids - new_ids)
+    assert set(view.visible_ids()) == new_ids
+    del chromadb
 
 
 def test_the_chroma_view_refuses_a_switch_it_does_not_implement(chroma_backend):

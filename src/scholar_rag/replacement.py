@@ -260,6 +260,12 @@ _EMBEDDED_ABSOLUTE_PATH_PATTERN = re.compile(
 )
 _TRAVERSAL_PATTERN = re.compile(r"(?:^|[\\/])\.\.(?:$|[\\/])")
 
+#: Collection metadata keys Chroma reports on read but refuses to accept back in
+#: ``modify``.  ``hnsw:space`` is the distance function: immutable by design, held
+#: in the collection configuration, and a re-sent value is read as a request to
+#: change it.  R5 therefore merges every other key and leaves this one alone.
+_CHROMA_RESERVED_METADATA_KEYS: frozenset[str] = frozenset({"hnsw:space"})
+
 
 # ---------------------------------------------------------------------------
 # Typed refusals
@@ -1131,7 +1137,27 @@ class ChromaReplacementView:
                 "so a partial staging is not switchable.",
                 field="visible_chunks",
             )
-        self._collection.modify(metadata={"visible_generation": run_id})
+        # Chroma's ``modify(metadata=...)`` *replaces* the collection metadata
+        # mapping rather than merging into it, so writing only the marker here
+        # would silently discard every other key the collection carried --
+        # including an operator's own keys and a legacy configuration's. Read,
+        # merge, write instead. The read-modify-write is safe here precisely
+        # because 7.4 holds the workspace lock across R1-R7: this is the
+        # protocol's single writer, so no other run can be mutating the same
+        # collection metadata.
+        existing = {
+            key: value
+            for key, value in dict(self._collection.metadata or {}).items()
+            # ``hnsw:space`` reads back as ordinary metadata but is refused by
+            # ``modify``, which reads a re-sent value as an attempt to change the
+            # collection's distance function. The distance function is immutable
+            # by design and lives in the collection *configuration*, so dropping
+            # the key from the write loses nothing: the seeded space stays in
+            # force, and refusing to re-send it keeps the switch from failing.
+            if key not in _CHROMA_RESERVED_METADATA_KEYS
+        }
+        existing["visible_generation"] = run_id
+        self._collection.modify(metadata=existing)
 
     def remove_obsolete(self, document_ids: Sequence[str], keep_ids: Sequence[str]) -> int:
         """Delete rows of *document_ids* the switch left behind.
