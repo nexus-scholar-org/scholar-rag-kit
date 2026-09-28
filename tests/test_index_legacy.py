@@ -64,8 +64,11 @@ from scholar_rag.recovery import (
 from scholar_rag.replacement import (
     COMMIT_INTENT_FILENAME,
     INDEX_DIR,
+    LOCK_FILENAME,
+    LOCK_SCHEMA_VERSION,
     ChromaReplacementView,
     IndexReplacement,
+    WorkspaceLock,
 )
 
 RUN_A = "RUN-" + "a" * 32
@@ -117,6 +120,58 @@ def recovery_for(workspace: Path, store: FakeBackend) -> IndexRecovery:
 
 def intent_path(workspace: Path, run_id: str) -> Path:
     return workspace / INDEX_DIR / run_id / COMMIT_INTENT_FILENAME
+
+
+def lock_path(workspace: Path) -> Path:
+    return workspace / INDEX_DIR / LOCK_FILENAME
+
+
+def write_orphan_lock(workspace: Path, *, run_id: str = RUN_A) -> bytes:
+    """Leave behind exactly what a crashed run leaves: a valid 7.4 lock record.
+
+    The ``acquired_at`` is deliberately ancient. A correct reader never looks at
+    it, so a test that puts a timestamp there and still expects a refusal is
+    asserting that much more than one that puts a fresh one there.
+    """
+
+    payload_bytes = (
+        canonical_json_bytes(
+            {
+                "schema_version": LOCK_SCHEMA_VERSION,
+                "workspace_id": "WS-legacy",
+                "run_id": run_id,
+                "acquired_at": "2001-01-01T00:00:00+00:00",
+            }
+        )
+        + b"\n"
+    )
+    path = lock_path(workspace)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(payload_bytes)
+    return payload_bytes
+
+
+def interrupted_with_partial_live_set(
+    workspace: Path, store: FakeBackend
+) -> tuple[dict[str, Any], dict[str, Any], list[str], list[str]]:
+    """Drive the real run into row 4b: new pointer, whole old set, partial live set.
+
+    The run dies inside R6, so the pointer is already on the candidate and the old
+    generation is still completely stored. Then the pointer is parked on a
+    *partial* candidate, which is the state that decides between restoring the old
+    generation and refusing: both are possible answers and the difference is
+    whether the old set is whole.
+    """
+
+    first, second = interrupted_second(workspace, store, fail_on="remove_obsolete")
+    old_ids = sorted(chunk["chunk_id"] for chunk in first["visible_chunks"])
+    candidate_ids = sorted(chunk["chunk_id"] for chunk in second["visible_chunks"])
+    assert set(old_ids) <= set(candidate_ids), "the fixture must make the two sets comparable"
+    assert len(candidate_ids) > len(old_ids), "a partial candidate must be missing a row"
+    # One candidate row is not visible: the live set is short of the candidate.
+    store.pointer = frozenset(candidate_ids[:-1])
+    assert store.generation == RUN_B, "the pointer did move before the crash"
+    return first, second, old_ids, candidate_ids
 
 
 def stored_ids(store: FakeBackend) -> set[str]:
@@ -287,6 +342,131 @@ def test_e3_pos_010_recovery_a_run_past_check_7_rolls_forward_and_reports_the_bu
     assert list((workspace / INDEX_DIR / RUN_B).glob("*.json"))
 
 
+def test_e3_pos_010_recovery_a_whole_candidate_after_r6_rolls_forward_as_row_4a(
+    workspace: Path, store: FakeBackend
+) -> None:
+    """Row 4a: R6 already ran, so the run rolls forward -- as row 4, not row 5.
+
+    This is the state the old classifier filed under R5/R6: a new pointer, a live
+    set equal to the candidate, and no residue. Calling that a "crash between R5 and
+    R6" is a factual claim about a run that had already finished removing the old
+    generation, and the adapter persists the reason into canonical provenance, so
+    the attribution has to be the state that actually occurred. The row is
+    R5-to-check-7, and the reason must not talk about R6.
+    """
+
+    first, second = run_fully(workspace, store)
+    candidate_ids = sorted(chunk["chunk_id"] for chunk in second["visible_chunks"])
+    old_ids = sorted(chunk["chunk_id"] for chunk in first["visible_chunks"])
+    assert sorted(store.visible_ids()) == candidate_ids
+    assert not [chunk for chunk in stored_ids(store) if chunk not in set(candidate_ids)], "R6 already ran"
+    assert not set(old_ids) - set(candidate_ids), "every old identity was also re-minted"
+
+    recovery = recovery_for(workspace, store)
+    facts = recovery.inspect(run_id=RUN_B, accepted=first)
+    assert recovery.classify(facts) == "intent_present_backend_on_new_pointer", facts
+    assert recovery.classify(facts) != "intent_present_backend_superset_on_new_pointer"
+
+    decision = recovery.recover(run_id=RUN_B, accepted=first, event_durable=True)
+
+    assert decision.row == "intent_present_backend_on_new_pointer", "row 4a, not row 5"
+    assert decision.state == "ROLLED_FORWARD"
+    assert decision.code is None, "a successful recovery is not a refusal"
+    assert decision.removed_obsolete_chunks == 0, "R6 had already finished; nothing to re-run"
+    assert sorted(store.visible_ids()) == candidate_ids
+    assert stored_ids(store) == set(candidate_ids), "no mixture is left behind"
+    assert decision.intent_removed is True
+    assert not intent_path(workspace, RUN_B).exists()
+    assert decision.event is not None
+    assert decision.event.action == "RAG_INDEX_BUILT"
+    assert decision.event.payload["recovery_row"] == "intent_present_backend_on_new_pointer"
+    # The reported reason must describe this state, not the one residue would mean.
+    assert "already gone" in decision.reason, decision.reason
+    for claim in ("between R5 and R6", "R6 is re-run", "superset", "not finished"):
+        assert claim not in decision.reason, (claim, decision.reason)
+
+
+def test_e3_pos_010_recovery_a_partial_candidate_restores_the_old_pointer(workspace: Path, store: FakeBackend) -> None:
+    """Row 4b: a partial candidate is rolled back onto the complete old generation.
+
+    This drives the only ``switch_visibility`` recovery has -- the old-pointer
+    restore -- which the reviewer's deletion probe showed nothing covered.
+    """
+
+    first, _second, old_ids, candidate_ids = interrupted_with_partial_live_set(workspace, store)
+    assert stored_ids(store) >= set(old_ids), "the old generation is intact"
+    assert set(store.visible_ids()) != set(candidate_ids), "the live set is short of the candidate"
+
+    recovery = recovery_for(workspace, store)
+    facts = recovery.inspect(run_id=RUN_B, accepted=first)
+    assert facts.previous_complete is True, "the old set is whole, so it may be restored"
+    assert recovery.classify(facts) == "intent_present_backend_on_new_pointer"
+
+    decision = recovery.recover(run_id=RUN_B, accepted=first, event_durable=True)
+
+    assert decision.row == "intent_present_backend_on_new_pointer"
+    assert decision.state == "ROLLED_BACK"
+    assert decision.code == "ATOMIC_COMMIT_FAILED"
+    assert decision.event is not None
+    assert decision.event.failing_step == "R5"
+    assert store.generation == RUN_A, "the pointer is restored to the old generation"
+    assert (RUN_A, tuple(old_ids)) in store.switches, "the restore went through switch_visibility"
+
+    # One index is complete and live, the other is not, and a reader sees neither a
+    # mixture nor a superset.
+    live = set(store.visible_ids())
+    stored = stored_ids(store)
+    complete_old = set(old_ids) <= stored
+    complete_new = set(candidate_ids) <= stored
+    assert complete_old is True
+    assert complete_new is False
+    assert live == set(old_ids), "a reader sees the restored old index and nothing else"
+    assert stored == live, "stored and live agree: no residue, no mixture"
+    assert not set(candidate_ids) - set(old_ids) & live, "no superseded row survived as visible"
+
+    assert decision.intent_removed is True
+    assert not intent_path(workspace, RUN_B).exists()
+    assert decision.event is not None
+    assert decision.event.payload["recovery_row"] == "intent_present_backend_on_new_pointer"
+    # G-9: the event is reported, never written by the kit.
+    assert not (workspace / "audit").exists()
+
+
+def test_e3_pos_010_recovery_the_same_partial_candidate_refuses_when_the_old_index_is_incomplete(
+    workspace: Path, store: FakeBackend
+) -> None:
+    """The other limb of the same decision, which is what makes 4b meaningful.
+
+    The state is identical to the restore test -- new pointer, partial live set --
+    and the only difference is one row missing from the old generation. A restore
+    would publish a partial old index, so recovery refuses with
+    ``BACKEND_STATE_INCONSISTENT`` and mutates nothing. Both limbs together are the
+    point: the branch is reached by the evidence, not by a hard-coded preference.
+    """
+
+    first, _second, old_ids, candidate_ids = interrupted_with_partial_live_set(workspace, store)
+    store.staged[RUN_A].pop(old_ids[0])
+    assert old_ids[0] not in {row.chunk_id for row in store.staged_rows(RUN_A)}, (
+        "the old generation lost a declared row"
+    )
+    before = stored_ids(store)
+
+    recovery = recovery_for(workspace, store)
+    facts = recovery.inspect(run_id=RUN_B, accepted=first)
+    assert facts.previous_complete is False, "the old set is no longer whole"
+    assert recovery.classify(facts) == "intent_present_backend_on_new_pointer", "same row, other limb"
+
+    decision = recovery.recover(run_id=RUN_B, accepted=first, event_durable=True)
+
+    assert decision.row == "intent_present_backend_on_new_pointer"
+    assert decision.state == "REFUSED"
+    assert decision.code == "BACKEND_STATE_INCONSISTENT"
+    assert decision.intent_removed is False, "a refusal keeps the intent for a human"
+    assert stored_ids(store) == before, "a refusal mutates nothing"
+    assert store.generation == RUN_B, "the pointer was not restored onto a partial old set"
+    assert intent_path(workspace, RUN_B).exists()
+
+
 def test_e3_pos_010_recovery_a_superset_on_the_new_pointer_re_runs_r6_and_rolls_forward(
     workspace: Path, store: FakeBackend
 ) -> None:
@@ -439,6 +619,109 @@ def test_e3_neg_044_a_recovery_that_cannot_restore_a_complete_old_index_refuses(
     assert decision.intent_removed is False, "a refusal keeps the intent for a human"
     assert stored_ids(store) == before, "a refusal mutates nothing"
     assert intent_path(workspace, RUN_B).exists()
+
+
+def test_e3_neg_052_recovery_refuses_while_the_workspace_lock_is_held(workspace: Path, store: FakeBackend) -> None:
+    """7.4: a run that may mutate the store takes the workspace lock first.
+
+    Recovery is a visibility switch like any other, so a live holder must stop it.
+    The lock here is a genuinely held one, taken through the frozen
+    ``WorkspaceLock``, and the refusal has to leave the interrupted run exactly as
+    it was found: staging, the intent and the store are all the next run's problem.
+    """
+
+    first, second = interrupted_second(workspace, store, fail_on="remove_obsolete")
+    live_lock = WorkspaceLock(
+        workspace_root=workspace,
+        workspace_id="WS-legacy",
+        run_id=RUN_C,
+        created_at="2026-01-01T00:00:00+00:00",
+    )
+    live_lock.acquire()
+    before_ids = stored_ids(store)
+    before_staging = {run: set(rows) for run, rows in store.staged.items()}
+    before_lock = lock_path(workspace).read_bytes()
+
+    decision = recovery_for(workspace, store).recover(run_id=RUN_B, accepted=first, event_durable=True)
+
+    assert decision.state == "REFUSED"
+    assert decision.code == "CONFLICT"
+    assert decision.failing_step == "R1", "the lock is taken at R1 and held through R7"
+    assert decision.intent_removed is False
+    assert decision.staging_discarded is False
+    assert decision.removed_obsolete_chunks == 0
+    assert decision.visible_after == decision.visible_before
+    assert stored_ids(store) == before_ids, "a refused recovery mutates nothing"
+    assert {run: set(rows) for run, rows in store.staged.items()} == before_staging, "staging is untouched"
+    assert intent_path(workspace, RUN_B).exists(), "the intent is kept for a human"
+    assert lock_path(workspace).read_bytes() == before_lock, "recovery did not take over a live lock"
+    assert live_lock.held is True
+    assert not store.switches[-1:] == [(RUN_A, tuple(sorted(chunk["chunk_id"] for chunk in first["visible_chunks"])))]
+    assert second["run_id"] == RUN_B
+
+
+def test_e3_neg_052_recovery_refuses_an_orphaned_lock_and_never_self_resolves_it(
+    workspace: Path, store: FakeBackend
+) -> None:
+    """7.4: a lock left by a crashed run is refused exactly like a live holder.
+
+    The lock file records a run id that is not the one being recovered and a
+    ``acquired_at`` from 2001, so any implementation that aged the file out would
+    resolve it here. Recovery must not: it never reads that timestamp, never
+    expires a file, and never decides a holder is gone. Deciding an orphan's fate
+    is an operator's call, and the kit does not make it.
+    """
+
+    first, _second = interrupted_second(workspace, store, fail_on="remove_obsolete")
+    orphan = write_orphan_lock(workspace, run_id=RUN_A)
+    before_ids = stored_ids(store)
+
+    decision = recovery_for(workspace, store).recover(run_id=RUN_B, accepted=first, event_durable=True)
+
+    assert decision.state == "REFUSED"
+    assert decision.code == "CONFLICT"
+    assert decision.intent_removed is False
+    assert stored_ids(store) == before_ids, "a refused recovery mutates nothing"
+    assert intent_path(workspace, RUN_B).exists(), "the intent is kept for a human"
+    assert lock_path(workspace).exists(), "the orphan lock is still there: nobody expired it"
+    assert lock_path(workspace).read_bytes() == orphan, "the orphan lock is byte-identical"
+
+    # And the orphan is not merely refused once: the refusal is stable, so a
+    # recovery cannot be nudged into resolving it by running again.
+    again = recovery_for(workspace, store).recover(run_id=RUN_B, accepted=first, event_durable=True)
+    assert again.code == "CONFLICT"
+    assert lock_path(workspace).read_bytes() == orphan
+
+
+def test_e3_pos_010_recovery_with_no_intent_stays_lock_free_even_under_a_lock(
+    workspace: Path, store: FakeBackend
+) -> None:
+    """The read-only row is not queued behind a holder it can never join.
+
+    Row 1 has no intent and provably mutates nothing, so it takes no lock. Locking
+    it would mean a recovery that cannot do anything is blocked by a holder it does
+    not contend with, and a caller waiting on that would wait forever.
+    """
+
+    published_first(workspace, store)
+    live_lock = WorkspaceLock(
+        workspace_root=workspace, workspace_id="WS-legacy", run_id=RUN_C, created_at="2026-01-01T00:00:00+00:00"
+    )
+    live_lock.acquire()
+    before_lock = lock_path(workspace).read_bytes()
+    before_ids = stored_ids(store)
+    before_calls = list(store.calls)
+
+    decision = recovery_for(workspace, store).recover(run_id=RUN_C, accepted=None)
+
+    assert decision.row == "no_intent"
+    assert decision.state == "PROCEED"
+    assert decision.event is None
+    assert stored_ids(store) == before_ids
+    assert lock_path(workspace).read_bytes() == before_lock, "the holder's lock is untouched"
+    assert live_lock.held is True
+    mutating = {"stage", "embed_staged", "switch_visibility", "remove_obsolete"}
+    assert not [call for call in store.calls[len(before_calls) :] if call in mutating]
 
 
 def test_e3_neg_044_the_intent_survives_until_the_reported_event_is_durable(
