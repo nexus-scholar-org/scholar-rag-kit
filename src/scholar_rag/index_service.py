@@ -394,6 +394,22 @@ class IndexServiceRequest(BaseModel):
                         "joined against.",
                         field=f"parent_view.documents.{position}.{name}",
                     )
+            # The admitted *artifact*, not just the document.  ``PARENT_RECORD_FIELDS``
+            # is T-50's frozen pair and is deliberately not widened here; these two
+            # are required because the eligibility join compares them -- T-50 joins a
+            # chunk's ``extracted_content_sha256`` against the record's -- so a record
+            # that does not state them cannot support the proof it exists for.  The CLI
+            # already refuses them for the same reason, and a check one surface
+            # performs and the other does not is exactly the API/CLI divergence
+            # E3-NEG-041 forbids.
+            for name in ("extracted_path", "extracted_content_sha256"):
+                if not isinstance(record.get(name), str) or not record[name].strip():
+                    raise IndexServiceValidationError(
+                        f"index service refuses parent_view.documents.{position} without {name!r}: the "
+                        "eligibility join proves that the parent accepted this exact extracted artifact, and "
+                        "a record that does not state it cannot be joined against.",
+                        field=f"parent_view.documents.{position}.{name}",
+                    )
             document_id = str(record["document_id"])
             if document_id in seen_parent_documents:
                 raise IndexServiceValidationError(

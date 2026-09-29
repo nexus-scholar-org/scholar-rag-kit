@@ -1435,6 +1435,127 @@ def _t90_plain(output: str) -> str:
     return re.sub(r"\x1b\[[0-9;]*m", "", output)
 
 
+#: A parent-record limb the CLI binds for every document, and the ways it can be
+#: wrong.  Each entry is (mutate, description); the mutation is applied to a copy
+#: of one well-formed record.
+T90_RECORD_LIMB_CASES = [
+    (lambda record: record.pop("study_id"), "missing study_id"),
+    (lambda record: record.pop("extracted_path"), "missing extracted_path"),
+    (lambda record: record.pop("extracted_content_sha256"), "missing extracted_content_sha256"),
+    (lambda record: record.pop("document_id"), "missing document_id"),
+    (lambda record: record.update(study_id="   "), "blank study_id"),
+    (lambda record: record.update(extracted_path="   "), "blank extracted_path"),
+    (lambda record: record.update(study_id=17), "wrong-typed study_id"),
+    (lambda record: record.update(extracted_path=["a", "b"]), "wrong-typed extracted_path"),
+]
+
+
+@pytest.mark.parametrize("mutate,description", T90_RECORD_LIMB_CASES, ids=[case[1] for case in T90_RECORD_LIMB_CASES])
+def test_t90_a_malformed_parent_record_is_refused_not_failed(tmp_path: Path, mutate, description):
+    """A malformed *record* limb is a refusal, on both surfaces, with exit 2.
+
+    The parent-view guard distinguishes a refusal (the caller stated something
+    malformed) from a failure (the run began and could not finish).  Without this
+    family the distinction is unpinned: deleting the record guard silently
+    downgrades every one of these cases to ``FAILED``/``DEPENDENCY_ERROR``/exit 4
+    with the suite still green, because a KeyError is simply absorbed by the
+    service's own defensive handler -- honestly, but with the wrong verdict.
+    """
+
+    root, view_path = t90_cli_workspace(tmp_path)
+    view = json.loads(view_path.read_text(encoding="utf-8"))
+    record = dict(view["documents"][0])
+    mutate(record)
+    view["documents"] = [record]
+    broken_path = view_path.with_name(f"parent_record_{description.replace(' ', '_')}.json")
+    broken_path.write_text(json.dumps(view), encoding="utf-8")
+
+    # Surface 1: the CLI, as a typed envelope and a contract exit code.
+    as_json = CliRunner().invoke(app, t90_cli_args(root, broken_path))
+    assert as_json.exit_code == INDEX_SERVICE_EXIT_CODES["REFUSED"], f"{description} must refuse, not crash"
+    assert "Traceback" not in as_json.output
+    envelope = json.loads(as_json.output)
+    assert envelope["outcome"] == "REFUSED"
+    assert envelope["codes"] == ["VALIDATION_ERROR"]
+    assert envelope["complete"] is False
+    assert envelope["sidecar_path"] is None
+    assert envelope["counts"] == {"accepted_documents": 0, "rejected_documents": 0, "visible_chunks": 0}
+
+    # Surface 2: the same malformed record offered to the Python API.  The API
+    # refuses it with the same frozen code; whether that arrives as a raised typed
+    # error (at request construction) or as a returned typed result depends only on
+    # which check catches it first, and both are the same verdict.
+    store = T90Store()
+    try:
+        request = t90_request(root, parent_view=view)
+    except IndexServiceValidationError as exc:
+        api_code = exc.code
+        assert api_code == "VALIDATION_ERROR"
+        assert envelope["codes"] == [api_code], "both surfaces must name the same frozen code"
+        return
+    api_result = index_workspace(
+        request,
+        backend=store,
+        reader=store,
+        embedder=t90_embedder,
+        workspace_root=root,
+    )
+    assert api_result.outcome == "REFUSED", f"{description} must refuse on the API too"
+    assert api_result.codes == ("VALIDATION_ERROR",)
+    assert api_result.outcome == envelope["outcome"], "the two surfaces must agree on the verdict"
+
+
+def _t90_broken_store_args(root: Path, view_path: Path, *, extra: list[str]) -> list[str]:
+    """``t90_cli_args`` with a store the CLI cannot open."""
+
+    return [*t90_cli_args(root, view_path), *extra]
+
+
+@pytest.mark.parametrize(
+    "extra,description",
+    [
+        (["--db-path", "AS_FILE"], "--db-path names a file, not a store directory"),
+        (["--collection", "c", "--db-path", "FRESH"], "--collection shorter than chroma allows"),
+    ],
+    ids=["db-path-is-a-file", "collection-too-short"],
+)
+def test_t90_a_store_the_cli_cannot_open_is_typed_not_a_crash(tmp_path: Path, extra, description):
+    """Opening a caller-named store happens in the CLI frame, before the service runs.
+
+    ``index_workspace`` cannot see a failure raised while its arguments are being
+    built, so an unhandled one escapes as a traceback and a non-contract exit 1.
+    Both reproduced inputs -- a ``--db-path`` that is a file, and a collection name
+    chroma rejects -- must answer with a typed envelope and a contract status.
+    """
+
+    root, view_path = t90_cli_workspace(tmp_path)
+    as_file = root / "db-is-a-file"
+    as_file.write_text("this is a file, not a store", encoding="utf-8")
+    resolved = [token.replace("AS_FILE", str(as_file)).replace("FRESH", str(root / "fresh-store")) for token in extra]
+
+    as_json = CliRunner().invoke(app, _t90_broken_store_args(root, view_path, extra=resolved))
+
+    assert as_json.exit_code in set(INDEX_SERVICE_EXIT_CODES.values()), (
+        f"{description} must exit with a contract status, never 1"
+    )
+    assert as_json.exit_code != 1, f"{description} escaped as a bare traceback exit"
+    assert "Traceback" not in as_json.output
+    envelope = json.loads(as_json.output)
+    assert envelope["outcome"] in INDEX_SERVICE_OUTCOMES
+    assert envelope["complete"] is False
+    assert envelope["counts"] == {"accepted_documents": 0, "rejected_documents": 0, "visible_chunks": 0}
+
+    # The same input on the human surface: still no traceback, still named.
+    as_human = CliRunner().invoke(
+        app,
+        [t for t in _t90_broken_store_args(root, view_path, extra=resolved + ["--format", "human"]) if t != "human"][
+            :-1
+        ],
+    )
+    assert as_human.exit_code == as_json.exit_code
+    assert "Traceback" not in as_human.output
+
+
 def test_t90_the_run_report_is_not_the_6_6_acceptance_event(tmp_path: Path):
     """A kit run report may never be mistaken for the adapter's acceptance event."""
 

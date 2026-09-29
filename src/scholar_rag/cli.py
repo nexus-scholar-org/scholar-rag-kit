@@ -33,6 +33,7 @@ from scholar_rag.index_service import (
     IndexServiceRequest,
     IndexServiceResult,
     IndexServiceValidationError,
+    JournalDependencyError,
     exit_code_for,
     index_workspace,
 )
@@ -284,12 +285,36 @@ def run_typed_index(
     # The kit's own two views over the same store: the write-side protocol for
     # R1-R7 and the read-side protocol for check 6. Neither is wrapped, decorated,
     # or replaced here.
+    #
+    # Constructing them happens in *this* frame, before ``index_workspace`` is
+    # entered, so the service's own defensive handler cannot see a failure here.
+    # Opening a store the caller named can fail for reasons the caller controls --
+    # a ``--db-path`` that is a file, a ``--collection`` chroma rejects -- and an
+    # uncaught one escapes as a bare traceback and a non-contract exit status.  The
+    # translation below is therefore part of this surface's contract, not a
+    # convenience: whatever the store does on open, this command answers with a
+    # typed outcome and a status from the contract's own mapping.
+    try:
+        backend = ChromaReplacementView(
+            db_path=db_path, collection_name=collection, embedder=embed, hnsw_space=hnsw_space
+        )
+        reader = ChromaVisibleSetReader(db_path=db_path, collection_name=collection)
+    except JournalDependencyError:
+        # Already typed by the store itself; re-raise so the handler above reports
+        # it unchanged rather than re-labelling an honest dependency failure.
+        raise
+    except Exception as exc:  # noqa: BLE001 - a store that will not open is reported, not crashed
+        raise IndexServiceValidationError(
+            f"index service could not open the store the caller named (db_path={str(db_path)!r}, "
+            f"collection={collection!r}): {type(exc).__name__}. The store path and the collection name "
+            f"are stated by the caller, so a store that will not open is a configuration the caller "
+            f"controls and it is refused as one -- never as a success, never as an empty successful "
+            f"result, and never as a traceback."
+        ) from None
     return index_workspace(
         request,
-        backend=ChromaReplacementView(
-            db_path=db_path, collection_name=collection, embedder=embed, hnsw_space=hnsw_space
-        ),
-        reader=ChromaVisibleSetReader(db_path=db_path, collection_name=collection),
+        backend=backend,
+        reader=reader,
         embedder=embed,
         workspace_root=workspace_root,
     )
