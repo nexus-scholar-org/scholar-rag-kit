@@ -1545,15 +1545,16 @@ def test_t90_a_store_the_cli_cannot_open_is_typed_not_a_crash(tmp_path: Path, ex
     assert envelope["complete"] is False
     assert envelope["counts"] == {"accepted_documents": 0, "rejected_documents": 0, "visible_chunks": 0}
 
-    # The same input on the human surface: still no traceback, still named.
-    as_human = CliRunner().invoke(
-        app,
-        [t for t in _t90_broken_store_args(root, view_path, extra=resolved + ["--format", "human"]) if t != "human"][
-            :-1
-        ],
-    )
+    # The same input on the human surface: same status, no traceback, and the
+    # typed outcome and code are still named rather than swallowed.  Built from
+    # the human-output arg builder so this is genuinely the human surface, not a
+    # second JSON run (``t90_cli_args`` appends ``--format <output>`` last).
+    as_human = CliRunner().invoke(app, [*t90_cli_args(root, view_path, output="human"), *resolved])
     assert as_human.exit_code == as_json.exit_code
-    assert "Traceback" not in as_human.output
+    plain = _t90_plain(as_human.output)
+    assert "Traceback" not in plain
+    assert envelope["outcome"] in plain, "the human line must name the typed outcome"
+    assert f"codes: {', '.join(envelope['codes'])}" in plain, "the human line must name the typed code"
 
 
 def test_t90_the_run_report_is_not_the_6_6_acceptance_event(tmp_path: Path):
