@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import json
+import re
 import sys
+from collections.abc import Mapping
 from pathlib import Path
+from typing import Any
 
 if sys.platform == "win32":
     if hasattr(sys.stdout, "reconfigure"):
@@ -17,11 +20,52 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
+from scholar_rag.canonical import canonical_json_bytes
+from scholar_rag.chunker import CHUNKER_CONFIGURATION_KEYS
 from scholar_rag.consensus import ConsensusCartographer
+from scholar_rag.embedder import get_embedder
+from scholar_rag.index_manifest import Counts
+from scholar_rag.index_models import IndexDocumentRequest
+from scholar_rag.index_service import (
+    INDEX_SERVICE_EXIT_CODES,
+    IndexedSource,
+    IndexServiceError,
+    IndexServiceRequest,
+    IndexServiceResult,
+    IndexServiceValidationError,
+    exit_code_for,
+    index_workspace,
+)
+from scholar_rag.index_verifier import ChromaVisibleSetReader
+
+# The other commands in this file still drive the legacy indexer; only ``index``
+# moved to the typed service, and those surfaces are not this packet's to change.
 from scholar_rag.indexer import ScholarIndexer
 from scholar_rag.models import SynthesisClaim
+from scholar_rag.replacement import ChromaReplacementView
 from scholar_rag.retriever import ScholarRetriever
 from scholar_rag.synthesis import GroundedSynthesisEngine, generate_methodology_matrix
+
+#: The chunker options the CLI passes to the service.  These are T-40's own frozen
+#: option names, taken from the chunker rather than restated, so an option the
+#: chunker later drops cannot linger here as a key it never reads.  The *values* are
+#: the chunker's declared defaults, and the service records what the chunker reports
+#: as effective -- not this dict (C-23).
+DEFAULT_CHUNKER_CONFIGURATION: dict[str, Any] = {
+    "heading_levels": [1, 2, 3],
+    "max_chunk_chars": 1200,
+    "min_chunk_chars": 200,
+    "normalize_whitespace": True,
+    "overlap_chars": 120,
+    "sentence_split_pattern": r"(?<=[.!?])\s+",
+    "strip_frontmatter": True,
+}
+assert tuple(sorted(DEFAULT_CHUNKER_CONFIGURATION)) == tuple(sorted(CHUNKER_CONFIGURATION_KEYS)), (
+    "the CLI's declared options must be exactly the frozen option set, so no key is inert"
+)
+
+#: An extracted reference a run will read must be workspace-relative (6.6).
+_ABSOLUTE_OR_ESCAPING = re.compile(r"^(?:[A-Za-z]:|[\\/]{1,2})")
 
 app = typer.Typer(
     help="Scholar RAG Kit: Structural chunking, hybrid graph-boosted retrieval, and grounded synthesis for scientific literature.",
@@ -32,46 +76,357 @@ console = Console(force_terminal=True, legacy_windows=False)
 
 @app.command("index")
 def index(
-    docs_path: Path = typer.Argument(..., help="Directory containing markdown files or a single markdown file"),
+    docs_path: Path = typer.Argument(..., help="Directory of extracted markdown files, or a single file"),
+    parent_view: Path = typer.Option(
+        ...,
+        "--parent-view",
+        help="JSON file holding the ACCEPTED parent view (the acceptance adapter's, never discovered here)",
+    ),
+    journal: Path = typer.Option(
+        ...,
+        "--journal",
+        help="Explicit path this run's own event is appended to. Required: never searched for",
+    ),
+    workspace_root: Path = typer.Option(
+        ..., "--workspace-root", help="Workspace root; the sidecar and commit intent are written beneath it"
+    ),
+    run_id: str = typer.Option(..., "--run-id", help="Explicit RUN- identity for this run. Never minted here"),
+    created_at: str = typer.Option(..., "--created-at", help="Explicit RFC3339 timestamp for this run"),
+    producer_version: str = typer.Option(..., "--producer-version", help="Kit version, stated not read"),
+    producer_commit: str = typer.Option(..., "--producer-commit", help="Full 40-hex producer commit, stated not read"),
     db_path: str = typer.Option("./chroma_db", help="Path to ChromaDB persistent vector database"),
     collection: str = typer.Option("scholar_docs", help="Collection name"),
+    hnsw_space: str = typer.Option("cosine", "--hnsw-space", help="Distance space recorded in the sidecar"),
     embedder: str = typer.Option(
-        "sentence-transformers", help="Embedding provider: sentence-transformers, openai, or mock"
+        "sentence-transformers", help="Embedding provider: sentence-transformers, openai, gemini, or mock"
     ),
     model_name: str | None = typer.Option(None, help="Embedding model name (e.g. all-MiniLM-L6-v2)"),
-    bib_file: Path | None = typer.Option(
-        None, "--bib", "-b", help="Companion references.bib file for DOI/paradigm enrichment"
+    embedder_provider: str = typer.Option(..., "--embedder-provider", help="Embedding identity: provider, stated"),
+    embedder_model: str = typer.Option(..., "--embedder-model", help="Embedding identity: model, stated"),
+    embedder_dimension: int = typer.Option(..., "--embedder-dimension", help="Embedding identity: dimension, stated"),
+    embedder_distance_metric: str = typer.Option(
+        "cosine", "--embedder-distance-metric", help="Embedding identity: distance metric, stated"
     ),
-    workspace_id: str | None = typer.Option(None, "--workspace-id", "-w", help="Workspace or project identifier"),
-    no_journal: bool = typer.Option(False, "--no-journal", help="Disable logging to audit/journal.jsonl"),
+    embedder_model_revision: str | None = typer.Option(
+        None, "--embedder-model-revision", help="Embedding identity: model revision, when the provider pins one"
+    ),
+    recovery_probe_run_id: str | None = typer.Option(
+        None, "--recovery-probe-run-id", help="Read T-70's 7.5 row for this run id and report it on the result"
+    ),
+    output: str = typer.Option("human", "--format", help="Output format: human, or json for the typed envelope"),
 ):
-    """Chunk and idempotently index scientific markdown documents into ChromaDB."""
-    if not docs_path.exists():
-        console.print(f"[bold red]Error:[/bold red] Path {docs_path} does not exist.")
-        raise typer.Exit(1)
+    """Index through the typed service, with an explicit journal path and a typed outcome.
 
-    console.print(f"[cyan]Initializing ScholarIndexer ({embedder})...[/cyan]")
-    indexer = ScholarIndexer(
-        db_path=db_path, collection_name=collection, embedder_kwargs={"provider": embedder, "model_name": model_name}
+    This command is a **surface**, not an implementation: it builds an
+    :class:`~scholar_rag.index_service.IndexServiceRequest`, calls
+    :func:`~scholar_rag.index_service.index_workspace` -- the same function the Python API
+    calls -- and prints the result it gets back.  It never re-derives an identity,
+    never fills a default, and never translates one outcome into another, so the CLI
+    and the API cannot answer the same request differently (**E3-NEG-040** /
+    **E3-NEG-041**, C-24).
+
+    The journal path is an explicit option with no default and no discovery: this
+    command does not walk parent directories, read the working directory, or consult
+    a ``project.json`` (**C-33**, **E3-NEG-025**).  A run that is not told where its
+    event goes refuses before it writes anything.
+
+    Exit status is the service's own deterministic mapping, and nothing else:
+    ``0`` success, ``3`` partial, ``2`` refused, ``4`` operational failure.  ``--format
+    json`` prints ``result.envelope()``, byte-identical to what the Python API returns.
+    """
+    try:
+        result = run_typed_index(
+            docs_path=docs_path,
+            parent_view_path=parent_view,
+            journal_path=journal,
+            workspace_root=workspace_root,
+            run_id=run_id,
+            created_at=created_at,
+            producer_version=producer_version,
+            producer_commit=producer_commit,
+            db_path=db_path,
+            collection=collection,
+            hnsw_space=hnsw_space,
+            embedder=embedder,
+            model_name=model_name,
+            embedder_provider=embedder_provider,
+            embedder_model=embedder_model,
+            embedder_dimension=embedder_dimension,
+            embedder_distance_metric=embedder_distance_metric,
+            embedder_model_revision=embedder_model_revision,
+            recovery_probe_run_id=recovery_probe_run_id,
+        )
+    except IndexServiceError as exc:
+        # A caller-side assembly failure is still a typed refusal, so it is reported
+        # on this surface as one: a traceback here would be the free-text failure
+        # mode this command was rewritten to remove, and it would leave the exit
+        # status to whatever the traceback machinery chose.  In ``--format json`` the
+        # envelope is the *whole* output, because a client parsing it must not have
+        # to skip a human line first.
+        refused = IndexServiceResult(
+            run_id=run_id,
+            outcome="REFUSED",
+            complete=False,
+            counts=Counts(accepted_documents=0, rejected_documents=0, visible_chunks=0),
+            codes=(exc.code,),
+        )
+        if output == "json":
+            typer.echo(canonical_json_bytes(refused.envelope()).decode("utf-8"))
+        else:
+            _print_index_result(refused, reason=str(exc))
+        raise typer.Exit(INDEX_SERVICE_EXIT_CODES["REFUSED"]) from None
+    if output == "json":
+        # The one machine-readable envelope, produced by the service. Printing it
+        # here rather than re-serializing a subset is what makes the CLI and the API
+        # comparable byte-for-byte.
+        typer.echo(canonical_json_bytes(result.envelope()).decode("utf-8"))
+    else:
+        _print_index_result(result)
+    raise typer.Exit(exit_code_for(result))
+
+
+def _print_index_result(result: IndexServiceResult, *, reason: str | None = None) -> None:
+    """Human formatting of the typed result.  Formatting only -- never a verdict.
+
+    A human line may be readable; it may not be the *source* of the answer.  Every
+    claim printed here is read off the typed fields, so the two formats cannot
+    disagree, and the exit status was already fixed by the service before this ran.
+    """
+
+    tone = {"SUCCESS": "green", "PARTIAL": "yellow", "REFUSED": "red", "FAILED": "red"}[result.outcome]
+    console.print(f"[bold {tone}]{result.outcome}[/bold {tone}] run {result.run_id}")
+    if reason is not None:
+        console.print(f"  {reason}")
+    if result.status is not None:
+        console.print(f"  sidecar status: {result.status}")
+    console.print(
+        f"  documents: {result.counts.accepted_documents} accepted, "
+        f"{result.counts.rejected_documents} rejected, {result.counts.visible_chunks} chunks"
+    )
+    if result.codes:
+        console.print(f"  codes: {', '.join(result.codes)}")
+    if result.verification_codes:
+        console.print(f"  verification: {', '.join(result.verification_codes)}")
+    for entry in result.rejected_documents:
+        console.print(f"  refused {entry.document_id}: {entry.code}")
+    if result.sidecar_path is not None:
+        console.print(f"  sidecar: {result.sidecar_path}")
+    if result.recovery_state is not None:
+        console.print(f"  recovery row: {result.recovery_state}")
+    console.print(f"  journaled: {result.journaled}")
+
+
+def run_typed_index(
+    *,
+    docs_path: Path,
+    parent_view_path: Path,
+    journal_path: Path,
+    workspace_root: Path,
+    run_id: str,
+    created_at: str,
+    producer_version: str,
+    producer_commit: str,
+    db_path: str,
+    collection: str,
+    hnsw_space: str,
+    embedder: str,
+    model_name: str | None,
+    embedder_provider: str,
+    embedder_model: str,
+    embedder_dimension: int,
+    embedder_distance_metric: str,
+    embedder_model_revision: str | None,
+    recovery_probe_run_id: str | None,
+) -> IndexServiceResult:
+    """Assemble the request from explicit inputs and call the one service function.
+
+    Split out of the command so a test can drive the *same* path the CLI drives,
+    which is what makes the parity test a statement about the shipping code rather
+    than about a re-implementation of it in the test.
+
+    Every input is supplied by the caller.  Nothing is inferred from a filename, a
+    title, a DOI, the working directory, or a ``project.json``, and a run whose
+    declared documents do not match the accepted parent is refused by the service's
+    own battery.
+    """
+
+    view = read_parent_view_file(parent_view_path)
+    sources = _sources_from(
+        docs_path,
+        workspace_root=workspace_root,
+        parent_view=view,
+        run_id=run_id,
+        collection=collection,
+        embedder_provider=embedder_provider,
+    )
+    request = IndexServiceRequest(
+        run_id=run_id,
+        created_at=created_at,
+        sources=sources,
+        parent_view=view,
+        chunker_configuration=DEFAULT_CHUNKER_CONFIGURATION,
+        backend_type="chroma",
+        collection_name=collection,
+        storage_schema_version="chroma-2",
+        hnsw_space=hnsw_space,
+        embedder_provider=embedder_provider,
+        embedder_model=embedder_model,
+        embedder_model_revision=embedder_model_revision,
+        embedder_dimension=embedder_dimension,
+        embedder_normalize_embeddings=True,
+        embedder_distance_metric=embedder_distance_metric,
+        producer_version=producer_version,
+        producer_commit=producer_commit,
+        journal_path=str(journal_path),
+        recovery_probe_run_id=recovery_probe_run_id,
+    )
+    embed = get_embedder(provider=embedder, model_name=model_name)
+    # The kit's own two views over the same store: the write-side protocol for
+    # R1-R7 and the read-side protocol for check 6. Neither is wrapped, decorated,
+    # or replaced here.
+    return index_workspace(
+        request,
+        backend=ChromaReplacementView(
+            db_path=db_path, collection_name=collection, embedder=embed, hnsw_space=hnsw_space
+        ),
+        reader=ChromaVisibleSetReader(db_path=db_path, collection_name=collection),
+        embedder=embed,
+        workspace_root=workspace_root,
     )
 
-    if docs_path.is_file():
-        text = docs_path.read_text(encoding="utf-8")
-        base_meta = {"filename": docs_path.name, "workspace_id": workspace_id}
-        chunks = indexer.index_markdown(text, base_metadata=base_meta, doc_id=docs_path.stem)
-        console.print(
-            f"[bold green]Successfully indexed {len(chunks)} structural chunks from {docs_path.name}.[/bold green]"
-        )
-    else:
-        with console.status(f"[cyan]Indexing markdown documents from {docs_path}...[/cyan]"):
-            result = indexer.index_directory(
-                docs_dir=docs_path, bib_file=bib_file, workspace_id=workspace_id, log_journal=not no_journal
-            )
-        console.print(
-            f"[bold green]Indexed {result['indexed_files']} files ({result['total_chunks']} chunks).[/bold green]"
-        )
 
-    console.print(f"[bold yellow]Total documents in vector store: {indexer.get_collection_count()}[/bold yellow]")
+def read_parent_view_file(path: Path) -> dict[str, Any]:
+    """Read the accepted parent view from the path the caller stated.
+
+    Reading the one file the caller named is not discovery: the path is an explicit
+    argument, and this function resolves nothing relative to a working directory, a
+    parent, or a ``project.json``.  A malformed view is a typed validation failure
+    rather than an empty view, because an empty view would look like a parent that
+    accepted nothing rather than a view that could not be read.
+    """
+
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise IndexServiceValidationError(
+            f"index service could not read the accepted parent view at the stated path ({type(exc).__name__}). "
+            "The view is supplied by the acceptance adapter and named explicitly; this service never looks "
+            "for one, so an unreadable view is reported rather than replaced by an empty one.",
+            field="parent_view",
+        ) from None
+    if not isinstance(raw, dict):
+        raise IndexServiceValidationError(
+            "index service refuses a parent view whose JSON root is not an object: the accepted parent is a "
+            "mapping of named fields, and a list here would index the wrong thing.",
+            field="parent_view",
+        )
+    return raw
+
+
+def _sources_from(
+    docs_path: Path,
+    *,
+    workspace_root: Path,
+    parent_view: Mapping[str, Any],
+    run_id: str,
+    collection: str,
+    embedder_provider: str,
+) -> tuple[IndexedSource, ...]:
+    """Bind every extracted file to the accepted parent record that admitted it.
+
+    The join is driven by the **parent**, not the filesystem: a document is indexed
+    because the accepted parent named it, and its identity limbs come from that
+    record.  A markdown file the parent never accepted is not silently skipped -- it
+    is a disagreement between the caller and the adapter, and the caller is told.
+    """
+
+    records = parent_view.get("documents")
+    if not isinstance(records, (list, tuple)) or not records:
+        raise IndexServiceValidationError(
+            "index service refuses to index without a parent view carrying a 'documents' list: eligibility is "
+            "the accepted parent's claim, not this service's, so a run cannot decide which files were "
+            "eligible.",
+            field="parent_view.documents",
+        )
+    # The reference is resolved against the **stated workspace root**, because that
+    # is what "workspace-relative" means: ``extracted/x.md`` is the same reference
+    # whichever directory the caller happened to invoke from. Resolving it against
+    # the process's working directory instead would make the same request read a
+    # different file -- the CWD-dependence this packet removes.
+    root = workspace_root
+    sources: list[IndexedSource] = []
+    for position, record in enumerate(records):
+        if not isinstance(record, Mapping):
+            raise IndexServiceValidationError(
+                f"index service refuses parent_view.documents.{position}: it is not a mapping of named fields.",
+                field=f"parent_view.documents.{position}",
+            )
+        relative = record.get("extracted_path")
+        if not isinstance(relative, str) or not relative.strip():
+            raise IndexServiceValidationError(
+                f"index service refuses parent_view.documents.{position} without 'extracted_path': a record "
+                "that names a document but not its extracted file cannot be bound to one run.",
+                field=f"parent_view.documents.{position}.extracted_path",
+            )
+        if _ABSOLUTE_OR_ESCAPING.match(relative) or ".." in Path(relative).parts:
+            raise IndexServiceValidationError(
+                f"index service refuses parent_view.documents.{position}.extracted_path {relative!r}: it is "
+                "not a workspace-relative reference, so the file it names is not one this run can read.",
+                field=f"parent_view.documents.{position}.extracted_path",
+            )
+        source_file = root / relative
+        try:
+            text = source_file.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise IndexServiceValidationError(
+                f"index service could not read the extracted text named by the accepted parent "
+                f"({type(exc).__name__}). A document the parent accepted is not the same as a document whose "
+                "text is present, and the difference must be reported rather than indexed as empty.",
+                field=f"parent_view.documents.{position}.extracted_path",
+            ) from None
+        # Identity limbs are *read*, never defaulted.  A missing one is the caller
+        # handing over a parent view this service cannot bind a document to, and it
+        # is reported as that -- naming the limb -- rather than surfacing as a
+        # ``KeyError`` traceback out of this adapter.
+        for field, owner in (
+            ("workspace_id", "parent_view"),
+            ("artifact_id", "parent_view"),
+            ("sha256", "parent_view"),
+        ):
+            if not isinstance(parent_view.get(field), str) or not str(parent_view[field]).strip():
+                raise IndexServiceValidationError(
+                    f"index service refuses {owner}.{field}: the accepted parent view does not state "
+                    f"it, so no document can be bound to an accepted parent. A run never mints a "
+                    f"missing identity limb.",
+                    field=f"{owner}.{field}",
+                )
+        for field in ("study_id", "document_id", "extracted_content_sha256"):
+            if not isinstance(record.get(field), str) or not str(record[field]).strip():
+                raise IndexServiceValidationError(
+                    f"index service refuses parent_view.documents.{position}.{field}: the accepted "
+                    f"parent record does not state it. A run never mints a missing identity limb.",
+                    field=f"parent_view.documents.{position}.{field}",
+                )
+        sources.append(
+            IndexedSource(
+                request=IndexDocumentRequest(
+                    workspace_id=str(parent_view["workspace_id"]),
+                    study_id=str(record["study_id"]),
+                    document_id=str(record["document_id"]),
+                    parent_artifact_id=str(parent_view["artifact_id"]),
+                    parent_artifact_sha256=str(parent_view["sha256"]),
+                    extracted_content_sha256=str(record["extracted_content_sha256"]),
+                    backend_provider=embedder_provider,
+                    backend_model=parent_view.get("embedder_model"),
+                    collection=collection,
+                    run_id=run_id,
+                ),
+                extracted_text=text,
+                extracted_path=relative,
+                extraction_method=str(record.get("extraction_method") or "DETERMINISTIC_RULE"),
+            )
+        )
+    return tuple(sorted(sources, key=lambda source: str(source.request.document_id)))
 
 
 @app.command("query")

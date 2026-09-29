@@ -1,5 +1,6 @@
 """Unit tests for scholar-rag CLI commands."""
 
+import json
 import re
 
 from typer.testing import CliRunner
@@ -14,9 +15,77 @@ def _plain(output: str) -> str:
     return re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", output)
 
 
+def _index_surface_args(tmp_path, docs_path, parent_view, journal, workspace_root=None):
+    """The explicit `index` surface: no CWD, no discovery, no `--no-journal`."""
+    return [
+        "index",
+        str(docs_path),
+        "--parent-view",
+        str(parent_view),
+        "--journal",
+        str(journal),
+        "--workspace-root",
+        str(workspace_root or tmp_path / "ws"),
+        "--run-id",
+        "RUN-" + "a" * 32,
+        "--created-at",
+        "2026-09-29T00:00:00Z",
+        "--producer-version",
+        "0.2.0",
+        "--producer-commit",
+        "c89b68f0d35173082a03b8c6b228e84381271185",
+        "--db-path",
+        str(tmp_path / "cli_test_db"),
+        "--embedder",
+        "mock",
+        "--embedder-provider",
+        "mock",
+        "--embedder-model",
+        "mock-embedder-v1",
+        "--embedder-dimension",
+        "8",
+    ]
+
+
+def _unadmitted_parent_view(tmp_path):
+    """A parent view naming one document, whose extracted text is not on disk.
+
+    The markdown the caller points at was never admitted, so the typed service
+    refuses to bind it -- the same fail-closed refusal the pre-T-90 flow produced
+    by accident, now produced deliberately and reported as a typed outcome.
+    """
+    workspace_root = tmp_path / "ws"
+    extracted = workspace_root / "extracted"
+    extracted.mkdir(parents=True, exist_ok=True)
+    (extracted / "paper.md").write_text(
+        "# Introduction\n\nLarge language models in science.\n",
+        encoding="utf-8",
+    )
+    parent_view = {
+        "artifact_id": "ART-" + "2" * 32,
+        "artifact_type": "document_manifest",
+        "sha256": "sha256:" + "3" * 64,
+        "workspace_id": "WSP-" + "0" * 32,
+        "protocol_fingerprint": "sha256:" + "6" * 64,
+        "corpus_fingerprint": "sha256:" + "7" * 64,
+        "documents": [
+            {
+                "document_id": "DOC-" + "9" * 32,
+                "study_id": "STU-" + "4" * 32,
+                "extracted_path": f"extracted/DOC-{'9' * 32}.md",
+                "extracted_content_sha256": "sha256:" + "8" * 64,
+                "extraction_method": "DETERMINISTIC_RULE",
+            }
+        ],
+    }
+    parent_view_path = tmp_path / "parent-view.json"
+    parent_view_path.write_text(json.dumps(parent_view), encoding="utf-8")
+    return parent_view_path
+
+
 def test_cli_index_and_query_flow(tmp_path):
-    docs_dir = tmp_path / "papers"
-    docs_dir.mkdir()
+    docs_dir = tmp_path / "ws" / "extracted"
+    docs_dir.mkdir(parents=True, exist_ok=True)
 
     md_file = docs_dir / "paper.md"
     md_file.write_text(
@@ -35,28 +104,24 @@ Reasoning accuracy increased by 22%.
 
     db_dir = tmp_path / "cli_test_db"
 
-    # 1. Index command.  A plain-markdown directory flow carries no accepted
-    # identity block (the CLI infers only filename/workspace-id, and that
-    # inference is owned by E3-T-30), so the chunker refuses with a typed error
-    # instead of minting a positional or content-derived fallback identity.
-    #
-    # KNOWN GAP, pinned deliberately: this refusing path exits non-zero with NO
-    # user-visible error text.  Typer swallows the ValueError, so the only output
-    # is the init/spinner/path chatter; the limb names never reach the user.  The
-    # assertions below therefore read the refusal out of
-    # ``index_res.exception`` rather than the console, and the gap is pinned in
-    # ``test_cli_refusal_error_text_is_not_yet_surfaced_to_the_user``.  Mapping
-    # and surfacing CLI errors is assigned to E3-T-30 / E3-T-90 and is explicitly
-    # out of scope for T-20, which must not change cli.py.
+    # 1. Index command, now on the typed service surface.  Eligibility is the
+    # accepted parent's claim, not this command's: the parent view below names a
+    # document whose extracted text is not present, so the run refuses instead of
+    # minting a positional or content-derived fallback identity.  The refusal is
+    # reported with the service's own deterministic exit status (2 = REFUSED) and
+    # its typed reasoning on the console -- T-90 removed the swallowed-ValueError
+    # gap that E3-T-30/T-20 had to pin around.
+    parent_view = _unadmitted_parent_view(tmp_path)
     index_res = runner.invoke(
-        app, ["index", str(docs_dir), "--db-path", str(db_dir), "--embedder", "mock", "--no-journal"]
+        app, _index_surface_args(tmp_path, docs_dir, parent_view, tmp_path / "ws" / "audit" / "journal.jsonl")
     )
-    assert index_res.exit_code != 0
+    assert index_res.exit_code == 2
     console_text = _plain(index_res.output)
-    refusal_text = " ".join(part for part in (console_text, str(index_res.exception)) if part)
-    assert "refuses to mint chunk identity" in refusal_text
-    for limb in ("workspace_id", "study_id", "document_id", "parent_artifact_id", "extracted_content_sha256"):
-        assert limb in refusal_text
+    assert "REFUSED" in console_text
+    assert "VALIDATION_ERROR" in console_text
+    # The reasoning names what disagreed, rather than being swallowed.
+    assert "accepted parent" in console_text
+    assert "Traceback" not in console_text
     assert "Indexed 1 files" not in console_text
     assert "Successfully indexed" not in console_text
 
@@ -94,39 +159,73 @@ Reasoning accuracy increased by 22%.
     assert not (tmp_path / "test_matrix.json").exists()
 
 
-def test_cli_refusal_error_text_is_not_yet_surfaced_to_the_user(tmp_path):
-    """Pins the D3 gap: the identity refusal is invisible at the console.
+def test_cli_refusal_error_text_is_surfaced_to_the_user(tmp_path):
+    """The identity refusal now reaches the operator, in typed form.
 
-    ``scholar-rag index`` correctly refuses (fail-closed, non-zero exit) when a
-    directory carries no accepted identity block, but typer lets the ValueError
-    escape without printing it, so an operator sees a non-zero exit and no
-    explanation.  Surfacing that error is assigned to E3-T-30 / E3-T-90; T-20 is
-    forbidden from touching cli.py, so this test records the current behaviour
-    instead of the desired one.  When T-30 lands and the message is printed, this
-    test is expected to FAIL and be inverted - that is the point of pinning it.
+    This test used to pin the D3 gap: ``scholar-rag index`` refused fail-closed but
+    typer let the ValueError escape unprinted, so an operator saw a non-zero exit
+    and no explanation.  E3-T-90 is the moment its own docstring predicted -- "When
+    T-30 lands and the message is printed, this test is expected to FAIL and be
+    inverted" -- so it is inverted here rather than deleted: the refusal is
+    asserted to be *visible*, named, and typed on both output formats.
     """
-    docs_dir = tmp_path / "papers"
-    docs_dir.mkdir()
+    docs_dir = tmp_path / "ws" / "extracted"
+    docs_dir.mkdir(parents=True, exist_ok=True)
     (docs_dir / "paper.md").write_text("# Introduction\n\nA claim.\n", encoding="utf-8")
 
-    result = runner.invoke(
-        app,
-        [
-            "index",
-            str(docs_dir),
-            "--db-path",
-            str(tmp_path / "cli_gap_db"),
-            "--embedder",
-            "mock",
-            "--no-journal",
-        ],
-    )
+    parent_view = _unadmitted_parent_view(tmp_path)
+    args = _index_surface_args(tmp_path, docs_dir, parent_view, tmp_path / "ws" / "audit" / "journal.jsonl")
+
+    result = runner.invoke(app, args)
     console_text = _plain(result.output)
 
-    # The failure is real and typed...
-    assert result.exit_code != 0
-    assert isinstance(result.exception, ValueError)
-    # ...but nothing of it reaches the operator.
-    assert "refuses to mint chunk identity" not in console_text
-    for limb in ("workspace_id", "study_id", "document_id"):
-        assert limb not in console_text
+    # The failure is real, typed, and deterministic...
+    assert result.exit_code == 2
+    # ...and it is no longer swallowed: the operator can see why.
+    assert "REFUSED" in console_text
+    assert "VALIDATION_ERROR" in console_text
+    assert "accepted parent" in console_text
+    assert "Traceback" not in console_text
+
+    # The specific thing the pinned gap could not show: the *name* of the limb
+    # that is missing reaches the operator.  Before T-90 the console carried only
+    # init/spinner chatter, so an operator saw a non-zero exit and no explanation.
+    incomplete = json.loads((tmp_path / "parent-view.json").read_text(encoding="utf-8"))
+    del incomplete["workspace_id"]
+    incomplete_path = tmp_path / "parent-view-missing-limb.json"
+    incomplete_path.write_text(json.dumps(incomplete), encoding="utf-8")
+
+    # A second, separate workspace: the named document's text is present here, so
+    # the missing limb is the operative refusal rather than the absent file, and
+    # the first run's state cannot mask it.
+    limb_root = tmp_path / "ws-limb"
+    admitted = limb_root / incomplete["documents"][0]["extracted_path"]
+    admitted.parent.mkdir(parents=True, exist_ok=True)
+    admitted.write_text("# Introduction\n\nAn admitted claim.\n", encoding="utf-8")
+
+    missing_limb = runner.invoke(
+        app,
+        [
+            *_index_surface_args(
+                tmp_path,
+                limb_root / "extracted",
+                incomplete_path,
+                limb_root / "audit" / "journal.jsonl",
+                workspace_root=limb_root,
+            )
+        ],
+    )
+    limb_text = _plain(missing_limb.output)
+    assert missing_limb.exit_code == 2
+    assert "workspace_id" in limb_text
+    assert "Traceback" not in limb_text
+    assert "KeyError" not in limb_text
+
+    # The machine surface carries the same verdict as a typed envelope, with the
+    # refusal code and no free-text success claim.
+    as_json = runner.invoke(app, [*args, "--format", "json"])
+    assert as_json.exit_code == 2
+    envelope = json.loads(_plain(as_json.output))
+    assert envelope["outcome"] == "REFUSED"
+    assert envelope["complete"] is False
+    assert envelope["counts"] == {"accepted_documents": 0, "rejected_documents": 0, "visible_chunks": 0}
