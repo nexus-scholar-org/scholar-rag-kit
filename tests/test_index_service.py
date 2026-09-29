@@ -54,6 +54,7 @@ from scholar_rag.index_service import (
     IndexServiceValidationError,
     exit_code_for,
     index_workspace,
+    store_open_result,
 )
 from scholar_rag.index_verifier import BACKEND_VERIFICATION_CODES, VISIBLE_GENERATION_KEY, VisibleRow
 from scholar_rag.indexer import ScholarIndexer
@@ -1512,38 +1513,72 @@ def _t90_broken_store_args(root: Path, view_path: Path, *, extra: list[str]) -> 
 
 
 @pytest.mark.parametrize(
-    "extra,description",
+    "extra,expected_outcome,expected_code,description",
     [
-        (["--db-path", "AS_FILE"], "--db-path names a file, not a store directory"),
-        (["--collection", "c", "--db-path", "FRESH"], "--collection shorter than chroma allows"),
+        (
+            ["--db-path", "AS_FILE"],
+            "REFUSED",
+            "VALIDATION_ERROR",
+            "--db-path names a file, not a store directory",
+        ),
+        (
+            ["--collection", "c", "--db-path", "FRESH"],
+            "REFUSED",
+            "VALIDATION_ERROR",
+            "--collection shorter than chroma allows",
+        ),
+        (
+            ["--db-path", "CORRUPT_STORE"],
+            "FAILED",
+            "DEPENDENCY_ERROR",
+            "--db-path holds a store whose database will not open",
+        ),
     ],
-    ids=["db-path-is-a-file", "collection-too-short"],
+    ids=["db-path-is-a-file", "collection-too-short", "db-path-is-a-corrupt-store"],
 )
-def test_t90_a_store_the_cli_cannot_open_is_typed_not_a_crash(tmp_path: Path, extra, description):
+def test_t90_a_store_the_cli_cannot_open_is_typed_not_a_crash(
+    tmp_path: Path, extra, expected_outcome, expected_code, description
+):
     """Opening a caller-named store happens in the CLI frame, before the service runs.
 
     ``index_workspace`` cannot see a failure raised while its arguments are being
     built, so an unhandled one escapes as a traceback and a non-contract exit 1.
-    Both reproduced inputs -- a ``--db-path`` that is a file, and a collection name
-    chroma rejects -- must answer with a typed envelope and a contract status.
+    Every reproduced input must answer with a typed envelope and a contract status.
+
+    The mapping is pinned per case, not merely checked to be *some* contract
+    outcome, because the two failure classes are not interchangeable: a store whose
+    *shape* or *name* the caller stated is a refusal (the caller can fix it), while
+    a store that will not open on a well-formed request is an operational failure
+    of a declared dependency (the caller cannot).  Collapsing either into the other
+    is the defect this case exists to catch, so each expected pair is exact.
     """
 
     root, view_path = t90_cli_workspace(tmp_path)
     as_file = root / "db-is-a-file"
     as_file.write_text("this is a file, not a store", encoding="utf-8")
-    resolved = [token.replace("AS_FILE", str(as_file)).replace("FRESH", str(root / "fresh-store")) for token in extra]
+    corrupt = root / "corrupt-store"
+    corrupt.mkdir()
+    (corrupt / "chroma.sqlite3").write_bytes(b"this is not a sqlite database, and never was, " * 32)
+    resolved = [
+        token.replace("AS_FILE", str(as_file))
+        .replace("FRESH", str(root / "fresh-store"))
+        .replace("CORRUPT_STORE", str(corrupt))
+        for token in extra
+    ]
 
     as_json = CliRunner().invoke(app, _t90_broken_store_args(root, view_path, extra=resolved))
 
-    assert as_json.exit_code in set(INDEX_SERVICE_EXIT_CODES.values()), (
-        f"{description} must exit with a contract status, never 1"
+    assert as_json.exit_code == INDEX_SERVICE_EXIT_CODES[expected_outcome], (
+        f"{description} must exit {expected_outcome}, never another status"
     )
     assert as_json.exit_code != 1, f"{description} escaped as a bare traceback exit"
     assert "Traceback" not in as_json.output
     envelope = json.loads(as_json.output)
-    assert envelope["outcome"] in INDEX_SERVICE_OUTCOMES
+    assert envelope["outcome"] == expected_outcome, f"{description} was classified as the wrong outcome"
+    assert envelope["codes"] == [expected_code], f"{description} carried the wrong frozen code"
     assert envelope["complete"] is False
     assert envelope["counts"] == {"accepted_documents": 0, "rejected_documents": 0, "visible_chunks": 0}
+    assert envelope["journaled"] is False, "a run that never began journaled nothing"
 
     # The same input on the human surface: same status, no traceback, and the
     # typed outcome and code are still named rather than swallowed.  Built from
@@ -1555,6 +1590,61 @@ def test_t90_a_store_the_cli_cannot_open_is_typed_not_a_crash(tmp_path: Path, ex
     assert "Traceback" not in plain
     assert envelope["outcome"] in plain, "the human line must name the typed outcome"
     assert f"codes: {', '.join(envelope['codes'])}" in plain, "the human line must name the typed code"
+
+
+def test_t90_store_open_result_separates_a_caller_shape_from_an_environment_fault(tmp_path: Path):
+    """The store-open verdict is the caller/environment line, and only that line.
+
+    Pinned at the boundary rather than only through the CLI, because the CLI is
+    where the first version got it wrong: a blanket catch reported a corrupt store
+    as a malformed request.  The classifier is the one place that decides, so it is
+    tested directly with signal exceptions -- no chroma import, so this pins the
+    *rule* (path shape and name shape are the caller's; everything else is the
+    environment's) rather than one backend's exception names.
+
+    Note the deliberate boundary: the three path-shape errors are exactly the
+    packet's list, so ``FileNotFoundError`` -- which a ``--db-path`` under an
+    existing file also raises -- is operational here, not a refusal.
+    """
+
+    root, _view_path = t90_cli_workspace(tmp_path)
+    request = t90_request(root)
+    db_path, collection = str(root / "store"), T90_COLLECTION
+
+    caller_shape = (
+        FileExistsError("--db-path already names a file"),
+        NotADirectoryError("--db-path is under a file"),
+        IsADirectoryError("--db-path is a directory where a file was expected"),
+        type("InvalidArgumentError", (Exception,), {})("that collection name is not usable"),
+    )
+    for exc in caller_shape:
+        result = store_open_result(request, exc, db_path=db_path, collection=collection)
+        assert result.outcome == "REFUSED", f"{type(exc).__name__} is the caller's to fix"
+        assert result.codes == ("VALIDATION_ERROR",)
+        assert result.complete is False
+        assert result.journaled is False
+
+    environment = (
+        type("InternalError", (Exception,), {})("error returned from database"),
+        PermissionError("the process may not write here"),
+        OSError("the store volume went away"),
+        FileNotFoundError("--db-path is under an existing file"),
+        KeyError("an unexpected store defect"),
+    )
+    for exc in environment:
+        result = store_open_result(request, exc, db_path=db_path, collection=collection)
+        assert result.outcome == "FAILED", f"{type(exc).__name__} is not the caller's to fix"
+        assert result.codes == ("DEPENDENCY_ERROR",), "an unmet dependency is a DEPENDENCY_ERROR"
+        assert result.complete is False
+        assert result.journaled is False, "a run that never began journaled nothing"
+
+    # The two verdicts are distinct, and neither is ever a success.
+    shape = store_open_result(request, FileExistsError("x"), db_path=db_path, collection=collection)
+    fault = store_open_result(request, OSError("x"), db_path=db_path, collection=collection)
+    assert shape.outcome != fault.outcome
+    assert exit_code_for(shape) == 2 and exit_code_for(fault) == 4
+    for result in (shape, fault):
+        assert result.outcome not in {"SUCCESS", "PARTIAL"}
 
 
 def test_t90_the_run_report_is_not_the_6_6_acceptance_event(tmp_path: Path):
@@ -1769,10 +1859,42 @@ def test_t90_the_run_timestamp_is_stated_not_read_from_a_clock():
         t90_request(Path("."), created_at="2026-09-29")
 
 
-def test_t90_a_document_whose_parent_limbs_disagree_with_the_parent_view_is_refused():
+@pytest.mark.parametrize(
+    "perturbed,description",
+    [
+        (("artifact_id",), "only the parent artifact id disagrees"),
+        (("sha256",), "only the parent content fingerprint disagrees"),
+        (("workspace_id",), "only the parent workspace disagrees"),
+        (("artifact_id", "sha256", "workspace_id"), "every parent limb disagrees"),
+    ],
+    ids=["parent-artifact-id", "parent-sha256", "parent-workspace-id", "all-three-limbs"],
+)
+def test_t90_a_document_whose_parent_limbs_disagree_with_the_parent_view_is_refused(perturbed, description):
+    """A document is bound to the parent this run was handed, limb for limb.
+
+    Every perturbed value stays well formed -- a different ``ART-``/``WSP-`` id and
+    a different but valid ``sha256:`` fingerprint -- so the pattern checks above
+    cannot be what refuses it; only the cross-check against the parent view can.
+
+    The "every parent limb disagrees" row is what makes the assertion about
+    *disagreement* rather than about the guard firing at all.  The guard loops over
+    three limbs, so with only one perturbed the other two still agree, and a
+    comparison flipped to test for agreement would raise on one of those instead
+    and pass this test while no longer refusing the limb that actually disagreed.
+    Perturbing all three leaves no limb to agree, so only a genuine
+    "disagrees is refused" comparison can satisfy it.
+    """
+
     view = t90_parent_view(T90_DOCUMENT)
+    broken = dict(view)
+    for name in perturbed:
+        broken[name] = {
+            "artifact_id": "ART-" + "9" * 32,
+            "sha256": "sha256:" + "9" * 64,
+            "workspace_id": "WSP-" + "9" * 32,
+        }[name]
     with pytest.raises(IndexServiceValidationError):
-        t90_request(Path("."), parent_view={**view, "sha256": "sha256:" + "9" * 64})
+        t90_request(Path("."), parent_view=broken)
 
 
 def test_t90_a_parent_view_without_its_documents_is_refused():

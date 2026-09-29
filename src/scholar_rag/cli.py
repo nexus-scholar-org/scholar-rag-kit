@@ -33,9 +33,9 @@ from scholar_rag.index_service import (
     IndexServiceRequest,
     IndexServiceResult,
     IndexServiceValidationError,
-    JournalDependencyError,
     exit_code_for,
     index_workspace,
+    store_open_result,
 )
 from scholar_rag.index_verifier import ChromaVisibleSetReader
 
@@ -290,27 +290,21 @@ def run_typed_index(
     # entered, so the service's own defensive handler cannot see a failure here.
     # Opening a store the caller named can fail for reasons the caller controls --
     # a ``--db-path`` that is a file, a ``--collection`` chroma rejects -- and an
-    # uncaught one escapes as a bare traceback and a non-contract exit status.  The
-    # translation below is therefore part of this surface's contract, not a
-    # convenience: whatever the store does on open, this command answers with a
-    # typed outcome and a status from the contract's own mapping.
+    # uncaught one escapes as a bare traceback and a non-contract exit status.
+    #
+    # What the failure *means* is not decided here: ``store_open_result`` holds the
+    # verdict vocabulary, so a store whose shape or name the caller controls is a
+    # REFUSED/exit 2 and a store that simply will not open on a well-formed request
+    # is a FAILED/DEPENDENCY_ERROR/exit 4.  Deciding it on this surface is what
+    # produced the first version's bug, where a corrupt store was reported to the
+    # caller as a malformed request.
     try:
         backend = ChromaReplacementView(
             db_path=db_path, collection_name=collection, embedder=embed, hnsw_space=hnsw_space
         )
         reader = ChromaVisibleSetReader(db_path=db_path, collection_name=collection)
-    except JournalDependencyError:
-        # Already typed by the store itself; re-raise so the handler above reports
-        # it unchanged rather than re-labelling an honest dependency failure.
-        raise
     except Exception as exc:  # noqa: BLE001 - a store that will not open is reported, not crashed
-        raise IndexServiceValidationError(
-            f"index service could not open the store the caller named (db_path={str(db_path)!r}, "
-            f"collection={collection!r}): {type(exc).__name__}. The store path and the collection name "
-            f"are stated by the caller, so a store that will not open is a configuration the caller "
-            f"controls and it is refused as one -- never as a success, never as an empty successful "
-            f"result, and never as a traceback."
-        ) from None
+        return store_open_result(request, exc, db_path=db_path, collection=collection)
     return index_workspace(
         request,
         backend=backend,

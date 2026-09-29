@@ -132,7 +132,12 @@ INDEX_SERVICE_OUTCOMES: frozenset[str] = frozenset({"SUCCESS", "PARTIAL", "REFUS
 #: The code **C-33** assigns to a journal path that was discovered rather than
 #: stated, and to a journal write whose error was suppressed.  It is a frozen
 #: ``ErrorCode`` member restated by name, not a new one.
-JOURNAL_DEPENDENCY_CODE = "DEPENDENCY_ERROR"
+#:
+#: The audit journal is the *canonical* unmet dependency, not the only one, so the
+#: bare name is the one other conditions use; the journal-specific alias below is
+#: kept so existing readers and tests keep their own vocabulary.
+DEPENDENCY_CODE = "DEPENDENCY_ERROR"
+JOURNAL_DEPENDENCY_CODE = DEPENDENCY_CODE
 
 #: 4.5's "internal defect".  A bug in this module is reported as this, and never as
 #: an empty successful result (G-7).
@@ -247,6 +252,22 @@ class JournalDependencyError(IndexServiceError):
     """
 
     code = JOURNAL_DEPENDENCY_CODE
+
+
+class StoreDependencyError(IndexServiceError):
+    """A declared external dependency -- the vector store -- could not be opened.
+
+    The same ``DEPENDENCY_ERROR`` as :class:`JournalDependencyError`, because the
+    distinction that matters is not *which* dependency failed but *who caused* it:
+    the caller did not.  B1's behaviour table reserves ``REFUSED`` for a request or
+    configuration the caller controls, and assigns "execution/infrastructure did
+    not complete" to ``FAILED``; a store this run was told to open and could not
+    open is the second, not the first, and reporting it as a refusal would blame
+    the caller for the environment and hide a repairable fault behind a verdict
+    that says "fix your request".
+    """
+
+    code = DEPENDENCY_CODE
 
 
 # ---------------------------------------------------------------------------
@@ -724,6 +745,80 @@ def exit_code_for(result: IndexServiceResult) -> int:
             f"index service cannot map outcome {result.outcome!r} to an exit status.",
             field="outcome",
         ) from None
+
+
+#: Store-open failures that are a *path-shape* problem the caller stated, measured
+#: rather than guessed: the store creates its own directory, so a ``--db-path`` that
+#: already names a file raises ``FileExistsError`` there and a path that cannot
+#: hold a directory raises the sibling errors.
+STORE_PATH_SHAPE_ERRORS: tuple[type[BaseException], ...] = (
+    FileExistsError,
+    NotADirectoryError,
+    IsADirectoryError,
+)
+
+#: A store's own "that is not a usable name" refusal.  Matched on the type *name*
+#: so this module keeps no import of a particular backend: the service classifies
+#: the verdict vocabulary, and it does that identically whatever the store is, so
+#: importing chroma here would couple the contract to one implementation of it.
+#: Verified against chromadb 1.5.9, which raises ``InvalidArgumentError`` for a name
+#: outside ``[a-zA-Z0-9._-]`` of 3-512 characters.
+_STORE_NAME_REFUSALS = frozenset({"InvalidArgumentError", "InvalidCollectionException"})
+
+
+def store_open_result(
+    request: IndexServiceRequest,
+    exc: BaseException,
+    *,
+    db_path: str,
+    collection: str,
+) -> IndexServiceResult:
+    """The verdict for a store the caller named but which would not open.
+
+    Opening the store happens in the *surface* frame, before ``index_workspace`` is
+    entered, so the service cannot see the failure from inside the run.  This
+    function is the other half of that fact: the surface reports *what happened*
+    and this decides *what it means*, so a CLI and an API cannot disagree about a
+    store that would not open (the same division as :func:`exit_code_for`).
+
+    The line that matters is the one between the caller and the environment.  A
+    ``--db-path`` whose shape cannot hold a store, and a collection name the store
+    will not accept, are both things the caller stated and can change: those are
+    ``REFUSED`` with ``VALIDATION_ERROR``.  Everything else -- a store whose
+    database will not open, a directory the process may not write, a store that is
+    mid-corruption -- leaves a well-formed request unrun, which is B1's
+    "execution/infrastructure did not complete" and therefore ``FAILED`` with
+    ``DEPENDENCY_ERROR``.  The refusal vocabulary is the one thing this function
+    never does: a store that did not open is never reported as a success, and an
+    empty successful result is never reported at all.
+
+    Nothing is journaled here.  A run that never began has no index run to report,
+    so there is no 6.6 event to append; this is the same accounting the surface
+    already used for a request it could not assemble, and it is the only reason
+    this answer is not routed through :func:`_refused`, which does journal.
+    """
+
+    zero = Counts(accepted_documents=0, rejected_documents=0, visible_chunks=0)
+    if isinstance(exc, STORE_PATH_SHAPE_ERRORS) or type(exc).__name__ in _STORE_NAME_REFUSALS:
+        return IndexServiceResult(
+            run_id=request.run_id,
+            outcome="REFUSED",
+            complete=False,
+            counts=zero,
+            codes=("VALIDATION_ERROR",),
+        )
+    return _failure(
+        request,
+        zero,
+        StoreDependencyError(
+            f"index service could not open the store this run was told to use "
+            f"(db_path={str(db_path)!r}, collection={collection!r}): {type(exc).__name__}: {exc}. "
+            f"The request is well-formed and the caller controls no part of this, so it is an "
+            f"operational failure of a declared dependency rather than a refusal of the request: "
+            f"nothing is indexed, nothing is published, and no success is reported."
+        ),
+        recovery_state=None,
+    )
 
 
 # ---------------------------------------------------------------------------
