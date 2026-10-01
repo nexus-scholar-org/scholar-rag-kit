@@ -13,7 +13,9 @@ guarantee rather than a broken fixture.
 import ast
 import inspect
 import json
+import os
 import re
+import threading
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
@@ -780,7 +782,12 @@ def t90_parent_view(*documents: str) -> dict:
     return view
 
 
-def t90_source(document_id: str, *, text: str | None = None) -> IndexedSource:
+def t90_source(
+    document_id: str,
+    *,
+    text: str | None = None,
+    extracted_path: str | None = None,
+) -> IndexedSource:
     body = T90_TEXT if text is None else text
     return IndexedSource(
         request=IndexDocumentRequest(
@@ -796,7 +803,7 @@ def t90_source(document_id: str, *, text: str | None = None) -> IndexedSource:
             run_id=T90_RUN,
         ),
         extracted_text=body,
-        extracted_path=f"extracted/{document_id}.md",
+        extracted_path=f"extracted/{document_id}.md" if extracted_path is None else extracted_path,
         extraction_method="DETERMINISTIC_RULE",
     )
 
@@ -821,7 +828,9 @@ def t90_request(root: Path, /, **overrides) -> IndexServiceRequest:
         "embedder_distance_metric": T90_SPACE,
         "producer_version": "0.2.0",
         "producer_commit": T90_COMMIT,
-        "journal_path": str(root / "audit" / "journal.jsonl"),
+        # Workspace-relative, as the service now requires of both destinations.
+        "journal_path": T90_KIT_JOURNAL,
+        "docs_path": T90_DOCS,
     }
     fields.update(overrides)
     return IndexServiceRequest(**fields)
@@ -906,18 +915,38 @@ class T90Store(ReplacementBackend):
         return {"hnsw:space": T90_SPACE, VISIBLE_GENERATION_KEY: self.generation}
 
 
-def t90_workspace_root(tmp_path: Path, name: str = "ws") -> Path:
-    """A workspace root with an existing (empty) audit directory.
+#: This kit's own event destination, **relative to the workspace root**.
+#:
+#: **G-9**: the canonical ledger ``audit/journal.jsonl`` belongs to the workspace
+#: adapter and the service refuses it by construction, so no healthy-path fixture
+#: may point a run at it.  The kit writes its events here instead.
+T90_KIT_JOURNAL = "run-reports/rag-index.jsonl"
 
-    The directory exists on purpose: every journal-path test below must prove the
-    service *refuses* to find it, which is only a claim if there was something
-    there to find.  ``exist_ok`` because a test that breaks the journal path leaves
-    a *directory* where the file belongs, and a second fixture call in the same
-    test must not fail on its own setup.
+#: The parent view binds each document to ``extracted/<id>.md``, so the documents
+#: directory a healthy run states is ``extracted``.
+T90_DOCS = "extracted"
+
+
+def t90_workspace_root(tmp_path: Path, name: str = "ws") -> Path:
+    """A workspace root with an existing (empty) audit directory and docs directory.
+
+    Both exist on purpose.  ``audit/`` because every journal-path test below must
+    prove the service *refuses* to find it, which is only a claim if there was
+    something there to find.  ``extracted/`` because ``docs_path`` is load-bearing:
+    it must exist, be a directory, and cover every document the parent view names.
+    ``exist_ok`` because a test that breaks a path leaves a *directory* where the
+    file belongs, and a second fixture call in the same test must not fail on its
+    own setup.
     """
 
     root = tmp_path / name
     (root / "audit").mkdir(parents=True, exist_ok=True)
+    (root / T90_DOCS).mkdir(parents=True, exist_ok=True)
+    # The kit's own destination directory exists for the same reason ``audit/``
+    # does: the service appends to a stated path and never creates the directory
+    # tree for the caller, so a missing parent is the environment's business and is
+    # reported as the typed ``DEPENDENCY_ERROR`` it is.
+    (root / "run-reports").mkdir(parents=True, exist_ok=True)
     return root
 
 
@@ -934,8 +963,14 @@ def t90_run(root: Path, /, store: T90Store | None = None, **overrides) -> IndexS
     )
 
 
+def t90_journal_path(root: Path) -> Path:
+    """This kit's own event file inside ``root`` -- never the adapter's ledger."""
+
+    return root / "run-reports" / "rag-index.jsonl"
+
+
 def t90_events(root: Path) -> list[dict]:
-    journal = root / "audit" / "journal.jsonl"
+    journal = t90_journal_path(root)
     if not journal.exists():
         return []
     return [json.loads(line) for line in journal.read_text(encoding="utf-8").splitlines() if line.strip()]
@@ -1073,8 +1108,10 @@ def test_t90_the_working_directory_is_never_consulted_for_a_journal_path(tmp_pat
 def test_t90_neg_025_an_unwritable_journal_destination_is_a_typed_failure(tmp_path: Path):
     root = t90_workspace_root(tmp_path)
     # A directory where the event file should go: the write cannot succeed, and it
-    # must not be swallowed.
-    (root / "audit" / "journal.jsonl").mkdir()
+    # must not be swallowed.  It sits at *this kit's* destination -- pointing at the
+    # adapter's canonical ledger would be refused earlier, for a different reason
+    # (G-9), and would not exercise the failed-write path at all.
+    t90_journal_path(root).mkdir(parents=True)
 
     result = t90_run(root)
 
@@ -1087,7 +1124,7 @@ def test_t90_neg_025_an_unwritable_journal_destination_is_a_typed_failure(tmp_pa
 
 def test_t90_a_failed_journal_write_leaves_the_commit_intent_in_place(tmp_path: Path):
     root = t90_workspace_root(tmp_path)
-    (root / "audit" / "journal.jsonl").mkdir()
+    t90_journal_path(root).mkdir(parents=True)
 
     result = t90_run(root)
 
@@ -1101,7 +1138,7 @@ def test_t90_a_failed_journal_write_leaves_the_commit_intent_in_place(tmp_path: 
 
 def test_t90_a_journal_failure_reports_no_sidecar_claim(tmp_path: Path):
     root = t90_workspace_root(tmp_path)
-    (root / "audit" / "journal.jsonl").mkdir()
+    t90_journal_path(root).mkdir(parents=True)
 
     result = t90_run(root)
 
@@ -1134,6 +1171,9 @@ def t90_cli_workspace(tmp_path: Path, documents: tuple[str, ...] = (T90_DOCUMENT
     root = tmp_path / "cli-ws"
     (root / "audit").mkdir(parents=True)
     (root / "extracted").mkdir()
+    # This kit's own event destination directory (G-9).  ``audit/`` exists too and
+    # must stay empty: it is the adapter's ledger, which this kit never writes.
+    (root / "run-reports").mkdir()
     records = []
     for document_id in documents:
         body = T90_TEXT if document_id != T90_UNUSABLE else "   "
@@ -1160,8 +1200,9 @@ def t90_cli_args(root: Path, view_path: Path, db_name: str = "chroma", output: s
         str(root),
         "--parent-view",
         str(view_path),
+        # This kit's own destination (G-9), never the adapter's canonical ledger.
         "--journal",
-        str(root / "audit" / "journal.jsonl"),
+        str(t90_journal_path(root)),
         "--workspace-root",
         str(root),
         "--run-id",
@@ -1228,7 +1269,13 @@ def test_t90_neg_040_the_cli_delegates_to_the_one_shared_service_function(tmp_pa
     assert outcome.exit_code == INDEX_SERVICE_EXIT_CODES["REFUSED"]
     assert len(seen) == 1, "the CLI must delegate rather than index by itself"
     assert isinstance(seen[0], IndexServiceRequest)
-    assert seen[0].journal_path == str(root / "audit" / "journal.jsonl")
+    # The CLI hands the service a *workspace-relative* reference for both
+    # destinations, because that is the form containment is decided in.
+    assert seen[0].journal_path == T90_KIT_JOURNAL
+    # This CLI invocation names the workspace root itself as its documents
+    # directory, so the relative reference is "." -- the root, spelled the one way it
+    # can be spelled relative to itself.
+    assert seen[0].docs_path == "."
     assert t90_events(root) == [], "the CLI itself wrote nothing; the service owns the one append"
 
 
@@ -1302,7 +1349,7 @@ def test_t90_neg_041_the_api_and_the_cli_agree_on_a_refusal(tmp_path: Path, offl
 
 def test_t90_neg_041_the_api_and_the_cli_agree_on_a_journal_failure(tmp_path: Path, offline_embedder):
     root, view_path = t90_cli_workspace(tmp_path)
-    (root / "audit" / "journal.jsonl").mkdir()  # unwritable destination
+    t90_journal_path(root).mkdir(parents=True)  # unwritable destination
 
     cli_result = CliRunner().invoke(app, t90_cli_args(root, view_path))
 
@@ -1314,9 +1361,8 @@ def test_t90_neg_041_the_api_and_the_cli_agree_on_a_journal_failure(tmp_path: Pa
     assert envelope["complete"] is False
 
     other = t90_workspace_root(tmp_path, "api-failed")
-    (other / "extracted").mkdir()
     (other / f"extracted/{T90_DOCUMENT}.md").write_text(T90_TEXT, encoding="utf-8")
-    (other / "audit" / "journal.jsonl").mkdir()
+    t90_journal_path(other).mkdir(parents=True)
     store = T90Store()
     api_result = index_workspace(
         t90_request(other),
@@ -1395,7 +1441,11 @@ def test_t90_the_run_report_is_written_to_the_stated_path_and_nowhere_else(tmp_p
     assert events[0]["event_type"] == RUN_REPORT_EVENT_TYPE
     assert events[0]["action"] == ACTION_RUN_BUILT
     assert events[0]["run_id"] == result.run_id
-    assert sorted(path.name for path in root.iterdir()) == ["audit", "rag"]
+    # ``audit/`` is present in the fixture and is still empty after a healthy run:
+    # the adapter's ledger is not this kit's to write (G-9), and the run's own
+    # event landed in ``run-reports/`` instead.
+    assert sorted(path.name for path in root.iterdir()) == ["audit", "extracted", "rag", "run-reports"]
+    assert list((root / "audit").iterdir()) == [], "the adapter's canonical ledger is never written by this kit"
 
 
 def test_t90_a_parent_view_missing_a_limb_is_typed_not_a_traceback(tmp_path: Path):
@@ -1933,6 +1983,399 @@ def test_t90_an_embedder_reporting_a_different_dimension_is_refused(tmp_path: Pa
     assert result.codes == ("VALIDATION_ERROR",)
     assert result.live_set_matches is False
     assert result.sidecar_path is None
+
+
+# -- containment: the workspace, not the process, decides where a run may write -
+
+
+def test_t90_a_relative_journal_path_is_bound_to_the_workspace_not_the_cwd(tmp_path: Path, monkeypatch):
+    """A relative destination is the same file whichever directory we invoke from."""
+
+    root = t90_workspace_root(tmp_path)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+
+    result = t90_run(root)
+
+    assert result.outcome == "SUCCESS"
+    assert t90_events(root), "the event landed under the workspace root, not under the CWD"
+    assert not (elsewhere / "run-reports").exists(), (
+        "the process's working directory is not a destination: nothing was created there"
+    )
+
+
+@pytest.mark.parametrize(
+    ("journal_path", "description"),
+    [
+        ("/etc/rag/events.jsonl", "a POSIX absolute path"),
+        ("C:/outside/rag/events.jsonl", "a drive-absolute path"),
+        ("\\\\server\\share\\events.jsonl", "a UNC path"),
+        ("run-reports/../../escape/events.jsonl", "a traversal out of the workspace"),
+        ("../escape/events.jsonl", "a leading traversal"),
+    ],
+)
+def test_t90_an_absolute_or_escaping_journal_path_is_refused(tmp_path: Path, journal_path, description):
+    """A destination that leaves the workspace is refused, whatever its spelling."""
+
+    root = t90_workspace_root(tmp_path)
+
+    result = t90_run(root, journal_path=journal_path)
+
+    assert result.outcome == "REFUSED", f"{description} must be refused"
+    assert result.codes == ("VALIDATION_ERROR",)
+    assert result.journaled is False
+    assert result.complete is False
+    assert exit_code_for(result) == INDEX_SERVICE_EXIT_CODES["REFUSED"]
+
+
+@pytest.mark.parametrize(
+    ("spelling", "description"),
+    [
+        ("ABSOLUTE", "an absolute path to this kit's own destination"),
+        ("TRAVERSAL", "a '..' path that lands back on this kit's own destination"),
+    ],
+)
+def test_t90_a_malformed_spelling_is_refused_even_when_it_would_resolve_inside(tmp_path: Path, spelling, description):
+    """The shape rules are not merely redundant with resolved containment.
+
+    Both spellings here name the *same in-workspace destination* a correct run
+    uses.  Only the lexical check can refuse them: resolved containment would pass
+    them, because resolved they land exactly where the run was going to write.  So
+    they are what proves the shape rules do real work rather than duplicating the
+    containment decision -- and, more importantly, that a request-shape refusal is
+    reported as such instead of depending on what the filesystem would have said.
+    """
+
+    root = t90_workspace_root(tmp_path)
+    in_scope = t90_journal_path(root)
+    journal_path = str(in_scope) if spelling == "ABSOLUTE" else "run-reports/../run-reports/rag-index.jsonl"
+
+    result = t90_run(root, journal_path=journal_path)
+
+    assert result.outcome == "REFUSED", f"{description} must be refused even though it resolves inside"
+    assert result.codes == ("VALIDATION_ERROR",)
+    assert result.journaled is False
+    assert not in_scope.exists(), "the refused request wrote nothing"
+
+
+def test_t90_the_canonical_audit_ledger_is_refused_as_this_kits_destination(tmp_path: Path):
+    """G-9: this kit never writes the adapter's ledger, and refuses it by construction."""
+
+    root = t90_workspace_root(tmp_path)
+    ledger = root / "audit" / "journal.jsonl"
+    ledger.write_text("", encoding="utf-8")
+
+    result = t90_run(root, journal_path="audit/journal.jsonl")
+
+    assert result.outcome == "REFUSED", "the adapter's canonical ledger is not this kit's to write"
+    assert result.codes == ("VALIDATION_ERROR",)
+    assert result.journaled is False
+    assert ledger.read_text(encoding="utf-8") == "", "the ledger was refused, not written through"
+
+
+def test_t90_the_ledger_refusal_covers_every_spelling_of_that_path(tmp_path: Path):
+    """Redundant separators and ``.`` segments do not get past the ledger check."""
+
+    root = t90_workspace_root(tmp_path)
+
+    for spelling in ("audit//journal.jsonl", "./audit/journal.jsonl", "audit/./journal.jsonl"):
+        result = t90_run(root, journal_path=spelling)
+        assert result.outcome == "REFUSED", f"{spelling!r} still names the canonical ledger"
+        assert not t90_journal_path(root).exists(), "no run wrote anywhere while the ledger check was being tested"
+
+
+def test_t90_a_ledger_shaped_journal_path_that_leaves_the_workspace_is_still_refused(tmp_path: Path):
+    """The ledger rule is about *this* workspace's ledger, not the name ``journal.jsonl``."""
+
+    root = t90_workspace_root(tmp_path)
+    outside = tmp_path / "outside"
+    (outside / "audit").mkdir(parents=True)
+
+    # ``other/audit/journal.jsonl`` is a different workspace's ledger, and reaching
+    # it is refused for the containment reason before the ledger name is considered.
+    result = t90_run(root, journal_path="../outside/audit/journal.jsonl")
+
+    assert result.outcome == "REFUSED"
+    assert result.codes == ("VALIDATION_ERROR",)
+    assert not (outside / "audit" / "journal.jsonl").exists()
+
+
+def test_t90_the_canonical_ledger_refusal_is_case_insensitive_on_windows(tmp_path: Path):
+    """The filesystem is case-insensitive here, so the rule must be too."""
+
+    root = t90_workspace_root(tmp_path)
+
+    result = t90_run(root, journal_path="AUDIT/Journal.JSONL")
+
+    assert result.outcome == "REFUSED", "AUDIT/Journal.JSONL is the same file on this platform"
+    assert result.codes == ("VALIDATION_ERROR",)
+
+
+# -- docs_path: required, contained, existing, and load-bearing --------------
+
+
+def test_t90_docs_path_is_required(tmp_path: Path):
+    """No default, no discovery: a request that omits it is not constructible."""
+
+    with pytest.raises(IndexServiceValidationError) as raised:
+        IndexServiceRequest(
+            **{
+                key: value
+                for key, value in {
+                    "run_id": T90_RUN,
+                    "created_at": T90_CREATED_AT,
+                    "sources": (t90_source(T90_DOCUMENT),),
+                    "parent_view": t90_parent_view(T90_DOCUMENT),
+                    "chunker_configuration": dict(T90_CHUNKER_CONFIG),
+                    "backend_type": "chroma",
+                    "collection_name": T90_COLLECTION,
+                    "storage_schema_version": "chroma-2",
+                    "hnsw_space": T90_SPACE,
+                    "embedder_provider": "test-provider",
+                    "embedder_model": "test-embedder-v1",
+                    "embedder_dimension": T90_DIMENSION,
+                    "embedder_normalize_embeddings": True,
+                    "embedder_distance_metric": T90_SPACE,
+                    "producer_version": "0.2.0",
+                    "producer_commit": T90_COMMIT,
+                    "journal_path": T90_KIT_JOURNAL,
+                }.items()
+            }
+        )
+    assert "docs_path" in str(raised.value)
+
+
+def test_t90_a_docs_path_that_does_not_exist_is_refused(tmp_path: Path):
+    """Named-but-absent is a request the caller can correct, so it is refused."""
+
+    root = t90_workspace_root(tmp_path)
+
+    result = t90_run(root, docs_path="extracted/not-here")
+
+    assert result.outcome == "REFUSED"
+    assert result.codes == ("VALIDATION_ERROR",)
+    # The destination was fine, so the refusal itself *is* recorded -- at this kit's
+    # own destination. What was refused is the run, not the audit trail.
+    assert result.journaled is True
+    assert [event["action"] for event in t90_events(root)] == [ACTION_RUN_REJECTED]
+
+
+def test_t90_a_docs_path_that_is_a_file_is_refused(tmp_path: Path):
+    """The field names a directory; a single file is a different request."""
+
+    root = t90_workspace_root(tmp_path)
+    (root / "extracted" / "a-file.md").write_text("not a directory", encoding="utf-8")
+
+    result = t90_run(root, docs_path="extracted/a-file.md")
+
+    assert result.outcome == "REFUSED"
+    assert result.codes == ("VALIDATION_ERROR",)
+
+
+@pytest.mark.parametrize(
+    "docs_path",
+    ["/etc", "C:/Windows", "extracted/../../outside", "../elsewhere"],
+)
+def test_t90_an_absolute_or_escaping_docs_path_is_refused(tmp_path: Path, docs_path):
+    """docs_path is bound to the workspace exactly as journal_path is."""
+
+    root = t90_workspace_root(tmp_path)
+
+    result = t90_run(root, docs_path=docs_path)
+
+    assert result.outcome == "REFUSED"
+    assert result.codes == ("VALIDATION_ERROR",)
+
+
+@pytest.mark.parametrize(
+    ("spelling", "description"),
+    [
+        ("ABSOLUTE", "an absolute path to the documents directory itself"),
+        ("TRAVERSAL", "a '..' path that lands on the documents directory itself"),
+    ],
+)
+def test_t90_a_malformed_docs_spelling_is_refused_even_when_it_would_resolve_inside(
+    tmp_path: Path, spelling, description
+):
+    """The shape rules for ``docs_path`` are not merely redundant with containment.
+
+    The same argument as the journal's: both spellings name the *correct*
+    in-workspace documents directory, so only the lexical check can refuse them.
+    Without it, resolved containment would accept them -- and the run would proceed
+    from a request the caller wrote in a shape the service does not accept.
+    """
+
+    root = t90_workspace_root(tmp_path)
+    docs_path = str(root / T90_DOCS) if spelling == "ABSOLUTE" else "elsewhere/../extracted"
+
+    result = t90_run(root, docs_path=docs_path)
+
+    assert result.outcome == "REFUSED", f"{description} must be refused even though it resolves inside"
+    assert result.codes == ("VALIDATION_ERROR",)
+    assert result.journaled is True, "the refusal is itself recorded; only the run was refused"
+
+
+def test_t90_a_docs_path_that_covers_no_parent_document_is_refused(tmp_path: Path):
+    """A documents directory that names none of the accepted parent's documents."""
+
+    root = t90_workspace_root(tmp_path)
+    (root / "elsewhere").mkdir()
+
+    result = t90_run(root, docs_path="elsewhere")
+
+    assert result.outcome == "REFUSED", "a docs directory outside the parent's documents decides nothing"
+    assert result.codes == ("VALIDATION_ERROR",)
+
+
+def test_t90_a_docs_path_covering_only_some_parent_documents_is_refused(tmp_path: Path):
+    """Partial coverage is refused: indexing part of a parent misreports the corpus.
+
+    `docs_path` is a *scope*, so covering one of two accepted documents is not a
+    smaller valid request -- it is a claim that the other document is not part of
+    this run's corpus, which a complete sidecar would then record for a parent that
+    admitted more.
+
+    The two documents carry different text, and each source names the same
+    `extracted_path` its parent record does, so nothing *else* refuses this run:
+    the only thing wrong with the request is the documents directory.  That is what
+    makes the test able to tell `docs_path` being enforced from `docs_path`
+    being merely validated and then ignored.
+    """
+
+    root = t90_workspace_root(tmp_path)
+    second = "DOC-" + "5" * 32
+    second_text = "# Introduction\n\nA second, differently worded claim for this study.\n"
+    (root / "extracted" / f"{T90_DOCUMENT}.md").write_text(T90_TEXT, encoding="utf-8")
+    (root / "extracted" / f"{second}.md").write_text(second_text, encoding="utf-8")
+    scoped = root / "scoped"
+    scoped.mkdir()
+    # The first document is reachable inside `scoped/`; the second is not.
+    (scoped / f"{T90_DOCUMENT}.md").write_text(T90_TEXT, encoding="utf-8")
+    view = dict(T90_PARENT_VIEW)
+    view["documents"] = [
+        {
+            "document_id": T90_DOCUMENT,
+            "study_id": T90_STUDY,
+            "extracted_path": f"scoped/{T90_DOCUMENT}.md",
+            "extracted_content_sha256": t90_fingerprint(T90_TEXT),
+            "extraction_method": "DETERMINISTIC_RULE",
+        },
+        {
+            "document_id": second,
+            "study_id": T90_STUDY,
+            "extracted_path": f"extracted/{second}.md",
+            "extracted_content_sha256": t90_fingerprint(second_text),
+            "extraction_method": "DETERMINISTIC_RULE",
+        },
+    ]
+
+    result = index_workspace(
+        t90_request(
+            root,
+            sources=(
+                t90_source(T90_DOCUMENT, extracted_path=f"scoped/{T90_DOCUMENT}.md"),
+                t90_source(second, text=second_text),
+            ),
+            parent_view=view,
+            docs_path="scoped",
+        ),
+        backend=T90Store(),
+        reader=T90Store(),
+        embedder=t90_embedder,
+        workspace_root=root,
+    )
+
+    assert result.outcome == "REFUSED", "one of two parent documents is outside the stated docs directory"
+    assert result.codes == ("VALIDATION_ERROR",)
+    assert result.sidecar_path is None, "nothing was indexed from a mis-scoped request"
+    assert [event["action"] for event in t90_events(root)] == [ACTION_RUN_REJECTED]
+
+
+# -- durability: one append, serialized, flushed, fsync'd before the result ---
+
+
+def test_t90_concurrent_appends_each_land_as_one_whole_event(tmp_path: Path):
+    """N threads appending N events produce N parsable lines, none interleaved."""
+
+    destination = tmp_path / "kit" / "events.jsonl"
+    destination.parent.mkdir(parents=True)
+    threads_count = 8
+    barrier = threading.Barrier(threads_count)
+
+    def append(index: int) -> None:
+        barrier.wait()
+        index_service.append_run_event(destination, {"n": index, "pad": "x" * 512})
+
+    threads = [threading.Thread(target=append, args=(index,)) for index in range(threads_count)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    lines = [line for line in destination.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert len(lines) == threads_count, "one event per caller, no lost appends"
+    assert sorted(json.loads(line)["n"] for line in lines) == list(range(threads_count)), (
+        "every line is one whole parsable event; an interleaved write would not parse"
+    )
+
+
+def test_t90_an_fsync_failure_is_a_typed_dependency_failure_not_a_swallowed_error(tmp_path: Path, monkeypatch):
+    """The bytes reached the page cache but not the disk: that is a failed append."""
+
+    destination = tmp_path / "events.jsonl"
+
+    def refuse_fsync(self):
+        raise OSError("simulated fsync failure")
+
+    monkeypatch.setattr(index_service.os, "fsync", refuse_fsync)
+
+    with pytest.raises(index_service.JournalDependencyError):
+        index_service.append_run_event(destination, {"n": 1})
+
+    # The service-level consequence: no success, no journaled claim.
+    root = t90_workspace_root(tmp_path, "ws")
+    monkeypatch.setattr(index_service.os, "fsync", refuse_fsync)
+    result = t90_run(root)
+
+    assert result.outcome == "FAILED"
+    assert JOURNAL_DEPENDENCY_CODE in result.codes
+    assert result.journaled is False, "a run whose event was not fsync'd never claims it was appended"
+    assert result.complete is False
+    assert result.sidecar_path is None
+
+
+def test_t90_the_append_is_flushed_and_fsyncd_before_the_result(tmp_path: Path, monkeypatch):
+    """The durability calls are not decoration: they happen, inside the lock."""
+
+    destination = tmp_path / "events.jsonl"
+    order: list[str] = []
+    real_fsync = os.fsync
+
+    def record_fsync(fd):
+        order.append("fsync")
+        return real_fsync(fd)
+
+    monkeypatch.setattr(index_service.os, "fsync", record_fsync)
+    index_service.append_run_event(destination, {"n": 1})
+    order.append("returned")
+    assert order == ["fsync", "returned"], "the fsync happens before the append returns to its caller"
+
+
+def test_t90_the_durability_guarantee_is_not_overclaimed(tmp_path: Path):
+    """The docstring promises an in-process lock and an fsync, and no more.
+
+    A guarantee of cross-process exclusion would be a claim this module cannot make
+    -- the lock is a module-level ``threading.Lock`` -- so the prose is checked for
+    the honest scope rather than left to a reader's imagination.
+    """
+
+    doc = inspect.getdoc(index_service.append_run_event) or ""
+
+    assert "in a single OS append call" in doc
+    assert "fsync" in doc
+    assert "cross-process" in doc, "the limitation is stated, not left implied"
+    assert "not* claimed" in doc or "is not claimed" in doc
 
 
 # -- the frozen primitives are preserved, and stay journal-free -------------

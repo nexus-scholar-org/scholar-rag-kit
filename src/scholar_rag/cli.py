@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
 from collections.abc import Mapping
@@ -35,6 +36,9 @@ from scholar_rag.index_service import (
     IndexServiceValidationError,
     exit_code_for,
     index_workspace,
+    require_contained,
+    require_extracted_documents_directory,
+    resolved_workspace_root,
     store_open_result,
 )
 from scholar_rag.index_verifier import ChromaVisibleSetReader
@@ -278,7 +282,14 @@ def run_typed_index(
         embedder_distance_metric=embedder_distance_metric,
         producer_version=producer_version,
         producer_commit=producer_commit,
-        journal_path=str(journal_path),
+        # Both destinations are stated **workspace-relative** on the request.  The
+        # caller may pass an absolute path for either, but the request records the
+        # reference the way containment is decided -- relative to the stated
+        # ``workspace_root`` -- so the service has one thing to check and cannot be
+        # handed a whole-filesystem path it would have to trust.  A caller who points
+        # either outside the workspace is refused, not normalized into one that fits.
+        journal_path=_workspace_relative_reference(journal_path, workspace_root, field="journal_path"),
+        docs_path=_workspace_relative_reference(docs_path, workspace_root, field="docs_path"),
         recovery_probe_run_id=recovery_probe_run_id,
     )
     embed = get_embedder(provider=embedder, model_name=model_name)
@@ -312,6 +323,45 @@ def run_typed_index(
         embedder=embed,
         workspace_root=workspace_root,
     )
+
+
+def _workspace_relative_reference(
+    value: str | Path,
+    workspace_root: str | Path,
+    *,
+    field: str,
+) -> str:
+    """Spell a caller-supplied path the way the service decides containment: relative.
+
+    The service binds ``journal_path`` and ``docs_path`` to the stated workspace root
+    and refuses anything that leaves it, so this function's job is to hand it a
+    *reference* rather than a whole-filesystem path.
+
+    It is deliberately not the place that decides containment.  If it refused here,
+    the two surfaces could disagree -- a CLI refusal the API never reproduces -- and
+    the parity this packet is about would be a property of this function rather
+    than of the service.
+
+    A **relative** caller path is passed through as the reference it already is, and
+    in particular is *not* resolved against the process working directory.  That is
+    the whole of F1: ``run-reports/rag-index.jsonl`` names the same file whether the
+    operator ran the command from the workspace, from ``/``, or from ``C:\\``.  A
+    ``resolve()`` here would re-anchor it to whatever directory happened to be
+    current, turn it into a ``..`` reference on the way out, and refuse a request the
+    service binds correctly -- a CWD-dependence re-introduced in the surface whose
+    job is to remove it.
+
+    An **absolute** caller path is expressed as a reference to ``workspace_root``,
+    because that is the form containment is decided in; one that already points
+    outside becomes a ``..`` reference and is refused **by the service**, not
+    silently rewritten here into something that happens to fit.
+    """
+
+    root = Path(workspace_root).resolve()
+    stated = Path(value)
+    if not stated.is_absolute():
+        return stated.as_posix()
+    return Path(os.path.relpath(stated.resolve(), root)).as_posix()
 
 
 def read_parent_view_file(path: Path) -> dict[str, Any]:
@@ -357,8 +407,20 @@ def _sources_from(
     because the accepted parent named it, and its identity limbs come from that
     record.  A markdown file the parent never accepted is not silently skipped -- it
     is a disagreement between the caller and the adapter, and the caller is told.
+
+    The selection is also **scoped to ``docs_path``**.  That positional argument
+    names the directory of extracted documents, so it decides *which* files this run
+    may read: a document the accepted parent names that resolves outside it is
+    refused here, naming the position, rather than being read anyway because the
+    parent mentioned it.  The parent is what makes a document eligible;
+    ``docs_path`` is what makes it reachable by this run, and both have to hold.
     """
 
+    root = workspace_root
+    docs_root = require_extracted_documents_directory(
+        _workspace_relative_reference(docs_path, workspace_root, field="docs_path"),
+        resolved_workspace_root(workspace_root),
+    )
     records = parent_view.get("documents")
     if not isinstance(records, (list, tuple)) or not records:
         raise IndexServiceValidationError(
@@ -372,7 +434,6 @@ def _sources_from(
     # whichever directory the caller happened to invoke from. Resolving it against
     # the process's working directory instead would make the same request read a
     # different file -- the CWD-dependence this packet removes.
-    root = workspace_root
     sources: list[IndexedSource] = []
     for position, record in enumerate(records):
         if not isinstance(record, Mapping):
@@ -393,7 +454,17 @@ def _sources_from(
                 "not a workspace-relative reference, so the file it names is not one this run can read.",
                 field=f"parent_view.documents.{position}.extracted_path",
             )
-        source_file = root / relative
+        # In scope means the document resolves *inside* the stated documents
+        # directory, decided on resolved paths so a link out of it is caught here
+        # too.  This is the check that makes ``docs_path`` load-bearing: without it
+        # the argument is accepted, validated as a directory, and then ignored in
+        # favour of wherever each parent record happens to point.
+        resolved_source = require_contained(
+            (root / relative).resolve(),
+            docs_root,
+            f"parent_view.documents.{position}.extracted_path",
+        )
+        source_file = resolved_source
         try:
             text = source_file.read_text(encoding="utf-8")
         except OSError as exc:

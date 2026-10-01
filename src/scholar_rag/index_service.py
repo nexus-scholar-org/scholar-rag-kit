@@ -73,12 +73,47 @@ written**, with ``DEPENDENCY_ERROR``, even when a perfectly good
 ``audit/journal.jsonl`` sits in the current working directory or in any parent of
 it.  ``_resolve_journal_path`` is the only place this module turns a string into a
 path, and it is total: it validates and it never searches.
+
+Containment is a property of the **stated workspace root**, not of the process's
+working directory.  ``IndexServiceRequest.journal_destination`` and
+``.docs_destination`` are the only places a caller-supplied reference becomes a
+path, and both
+
+1. reject the shape lexically -- an absolute path, a drive-relative ``C:`` prefix, a
+   UNC ``\\\\server\\share`` reference, a ``..`` segment, an empty or ``.`` segment,
+   all refused before any resolution, so a refusal cannot be produced by the
+   filesystem's own answer;
+2. join the remainder to the **resolved** ``workspace_root``;
+3. require the resolved destination to be *inside* the resolved workspace root.
+
+A relative reference therefore names the same file whichever directory the caller
+invoked the service from, and a reference that would leave the workspace is refused
+with ``VALIDATION_ERROR`` rather than honoured.  Symlink and junction escapes are
+caught by step 3 because the containment decision is made on resolved paths.
+
+The same containment governs ``docs_path``: it is a required field, it must resolve
+inside the workspace, it must exist and be a directory, and **every** document the
+accepted parent view names must resolve inside it.  ``docs_path`` is therefore
+load-bearing on both surfaces rather than accepted and ignored.
+
+Toolkit ownership (**G-9**)
+---------------------------
+The canonical audit ledger ``<workspace>/audit/journal.jsonl`` belongs to the
+*adapter* (the workspace/audit layer), not to this kit.  **No code in
+``scholar-rag-kit`` -- this service included -- ever writes it.**  This module does
+not merely document that rule: ``journal_destination`` refuses the canonical ledger
+path by construction, so a caller that points ``journal_path`` at it gets a typed
+``REFUSED``/``VALIDATION_ERROR`` before anything is written.  This kit writes its
+own event to its own distinct destination beneath the workspace (for example
+``run-reports/rag-index.jsonl``), and appends there in one OS append call,
+serialized in-process, flushed and fsync'd before the result is produced.
 """
 
 from __future__ import annotations
 
 import os
 import re
+import threading
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -183,12 +218,26 @@ INDEX_SERVICE_EXIT_CODES: dict[str, int] = {
 _COMMIT_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 
 #: Same shapes T-50 rule 11 and T-60 refuse in a persisted or returned string: a
-#: drive-relative or absolute path, and a ``..`` segment.  A *request* may state an
-#: absolute ``journal_path`` -- it is an input, not a claim -- but a *result* and
-#: the *event* may never carry one, so the two path fields are checked here and at
-#: the result's own construction.
+#: drive-relative or absolute path, and a ``..`` segment.  A *request* may state
+#: only a **workspace-relative** ``journal_path`` or ``docs_path`` -- they are
+#: inputs, but they are resolved against the stated workspace root and refused if
+#: they are absolute or escaping, while a *result* and the *event* may never carry
+#: an absolute path at all, so the checks are stricter on the way in and repeated
+#: on the two path fields at the result's own construction.
 _ABSOLUTE_PATH_PATTERN = re.compile(r"^(?:[A-Za-z]:|[\\/]{1,2})")
 _TRAVERSAL_PATTERN = re.compile(r"(?:^|[\\/])\.\.(?:$|[\\/])")
+
+#: The adapter-owned audit ledger.  **G-9**: it is not this kit's to write, so
+#: pointing ``journal_path`` at it is refused rather than honoured -- see
+#: :meth:`IndexServiceRequest.journal_destination`.
+_CANONICAL_AUDIT_LEDGER = ("audit", "journal.jsonl")
+
+#: Serializes :func:`append_run_event` inside this process so two threads cannot
+#: interleave a write and a flush for one another's event.  It is deliberately
+#: *not* claimed to be a cross-process lock: two separate processes writing the
+#: same file rely on ``O_APPEND`` positioning, not on this lock, and the guarantee
+#: claimed here is the in-process one plus the fsync that precedes the result.
+_APPEND_LOCK = threading.Lock()
 _RFC3339_UTC_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[Zz]|[+-]\d{2}:\d{2})$")
 
 
@@ -249,6 +298,13 @@ class JournalDependencyError(IndexServiceError):
     not append it (so it reports no success).  Both are ``DEPENDENCY_ERROR``,
     because in both cases a declared dependency -- the audit destination -- was not
     met, and neither is the caller's document content.
+
+    A *shape* problem with the stated destination is a different fault and is
+    deliberately **not** reported through this class: an absolute or escaping
+    ``journal_path``, or one that names the adapter-owned canonical ledger, is the
+    caller's own configuration and is an :class:`IndexServiceValidationError`
+    (``VALIDATION_ERROR``, ``REFUSED``).  Blaming the environment for a request the
+    caller can fix is how a repairable request bug gets reported as infrastructure.
     """
 
     code = JOURNAL_DEPENDENCY_CODE
@@ -321,9 +377,17 @@ class IndexServiceRequest(BaseModel):
     * ``created_at`` and ``producer_version`` / ``producer_commit`` are supplied,
       never read from a clock or from a package attribute, because both feed
       ``production_fingerprint`` and a default would be an identity nobody chose;
-    * ``journal_path`` is the **only** way the audit destination is learned.  It has
-      no default: ``None`` is constructible so the refusal is testable, and
-      :func:`index_workspace` refuses it before it writes anything.
+    * ``journal_path`` is the **only** way this kit's audit destination is
+      learned.  It has no default: ``None`` is constructible so the refusal is
+      testable, and :func:`index_workspace` refuses it before it writes anything.
+      It is a *workspace-relative* reference and is resolved against the stated
+      ``workspace_root``; the canonical adapter ledger ``audit/journal.jsonl`` is
+      refused (**G-9**), because this kit does not write it;
+    * ``docs_path`` is **required** and load-bearing.  It states the workspace-
+      relative directory holding this run's extracted documents, it must exist and
+      be a directory, and every document the accepted parent view names must
+      resolve inside it -- so a caller cannot name a docs directory and have the
+      run read elsewhere.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
@@ -347,6 +411,7 @@ class IndexServiceRequest(BaseModel):
     producer_version: str = Field(min_length=1)
     producer_commit: str = Field(min_length=1)
     journal_path: str | None = None
+    docs_path: str
     recovery_probe_run_id: str | None = None
 
     def __init__(self, **data: Any) -> None:
@@ -476,16 +541,24 @@ class IndexServiceRequest(BaseModel):
         if self.recovery_probe_run_id is not None:
             _require_run_id(self.recovery_probe_run_id, "recovery_probe_run_id")
 
-    # -- the one place a string becomes a path --------------------------
+    # -- the only places a string becomes a path -------------------------
 
-    def journal_destination(self) -> Path:
-        """The journal path, or a typed refusal.  Never a search.
+    def journal_destination(self, workspace_root: str | os.PathLike[str]) -> Path:
+        """This kit's own event destination, or a typed refusal.  Never a search.
 
         There is no branch here that consults the working directory, a parent
         directory, ``project.json``, or an environment value, and that is the whole
         point: **C-33** makes parent-walking and a suppressed write error the same
         ``DEPENDENCY_ERROR``, so a caller that forgot the field is told so instead of
         being quietly given a workspace's ledger.
+
+        The stated reference is then bound to ``workspace_root`` and held inside it
+        (see the module's *Containment* note), and the adapter-owned canonical
+        ledger is refused (**G-9**).  A malformed or escaping reference is the
+        caller's configuration, so it is a ``VALIDATION_ERROR`` refusal rather than
+        a ``DEPENDENCY_ERROR``: the distinction matters because the first says
+        "change the request" and the second says "repair the environment", and only
+        the second is true for an unwritable destination.
         """
 
         raw = self.journal_path
@@ -497,7 +570,23 @@ class IndexServiceRequest(BaseModel):
                 "cannot say where its audit event goes refuses before it writes anything.",
                 field="journal_path",
             )
-        return Path(str(raw))
+        root = resolved_workspace_root(workspace_root)
+        destination = _workspace_relative_destination(raw, root, field="journal_path")
+        _refuse_canonical_audit_ledger(destination, root)
+        return destination
+
+    def docs_destination(self, workspace_root: str | os.PathLike[str]) -> Path:
+        """The stated extracted-documents directory, or a typed refusal.
+
+        ``docs_path`` is required, so ``None`` is not constructible here; this
+        method still refuses a value that cannot identify a readable directory
+        rather than deferring to the first read that happens to fail, because "the
+        docs directory is not there" and "one document could not be read" are
+        different faults a caller repairs differently.
+        """
+
+        root = resolved_workspace_root(workspace_root)
+        return require_extracted_documents_directory(self.docs_path, root)
 
     def embedder_section(self) -> dict[str, Any]:
         """The declared embedding identity, exactly as the sidecar records it."""
@@ -652,7 +741,12 @@ def index_workspace(
     zero = Counts(accepted_documents=0, rejected_documents=0, visible_chunks=0)
     try:
         # C-33 gate 1: the destination is known before anything is written.
-        journal_path = request.journal_destination()
+        journal_path = request.journal_destination(workspace_root)
+        # Gate 1b: the documents directory is resolved and checked before anything
+        # is read or written, so a request that names a docs directory this run may
+        # not use refuses on the *request*, naming ``docs_path``, instead of being
+        # discovered one unreadable document at a time.
+        docs_path = request.docs_destination(workspace_root)
         if not callable(embedder):
             raise IndexServiceValidationError(
                 "index service refuses the run without an embedder: the embedding identity is an explicit "
@@ -670,7 +764,7 @@ def index_workspace(
                 field="embedder_dimension",
             )
         probe_state = _probe_recovery(request, backend=backend, workspace_root=workspace_root)
-        manifest = _build_candidate_manifest(request)
+        manifest = _build_candidate_manifest(request, docs_path=docs_path, workspace_root=workspace_root)
         replacement = IndexReplacement(workspace_root=workspace_root, backend=backend, embedder=embedder)
         try:
             outcome = replacement.run(
@@ -684,10 +778,12 @@ def index_workspace(
                 )
             )
         except ReplacementError as exc:
-            return _refused(request, zero, exc, recovery_state=probe_state)
+            return _refused(request, zero, exc, recovery_state=probe_state, workspace_root=workspace_root)
         verification = _verify(manifest, reader)
         if not verification.matches:
-            return _unverified(request, zero, manifest, verification, recovery_state=probe_state)
+            return _unverified(
+                request, zero, manifest, verification, recovery_state=probe_state, workspace_root=workspace_root
+            )
         service_outcome = "SUCCESS" if manifest.status == "SUCCESS" else "PARTIAL"
         return _journal(
             request,
@@ -712,11 +808,13 @@ def index_workspace(
             manifest=manifest,
         )
     except JournalDependencyError as exc:
+        # ``_failure`` never journals, so it needs no workspace root: the run could
+        # not state a usable destination, which is precisely why nothing is appended.
         return _failure(request, zero, exc, recovery_state=None)
     except IndexServiceError as exc:
-        return _refused(request, zero, exc, recovery_state=None)
+        return _refused(request, zero, exc, recovery_state=None, workspace_root=workspace_root)
     except (IndexManifestError, ValidationError) as exc:  # a T-50 or pydantic refusal
-        return _refused(request, zero, exc, recovery_state=None)
+        return _refused(request, zero, exc, recovery_state=None, workspace_root=workspace_root)
     except Exception as exc:  # noqa: BLE001 - a bug is reported, never a success
         return _failure(
             request,
@@ -909,17 +1007,34 @@ def append_run_event(journal_path: Path, event: Mapping[str, Any]) -> None:
     destination, a full disk, or a directory in the destination's place raises
     :class:`JournalDependencyError`, which :func:`index_workspace` turns into a
     ``FAILED`` result carrying ``DEPENDENCY_ERROR`` with ``journaled=False`` and
-    ``complete=False``.  The append is one line of canonical JSON, written in a
-    single ``write`` so a partial line cannot be mistaken for a whole event.
+    ``complete=False``.
+
+    Durability, precisely, because "the event was written" is the claim
+    ``journaled=True`` makes.  The line is appended in a single OS append call,
+    the call is serialized against other threads in this process by
+    :data:`_APPEND_LOCK`, and the bytes are flushed and ``fsync``'d **before** this
+    returns -- so when the caller is told the event landed, the event is on disk
+    rather than in a buffer that a crash would discard.  A ``write`` that raised,
+    a ``flush`` that raised, and an ``fsync`` that raised are all the same fault and
+    all become the same typed failure: a partial append is reported as a failed
+    append, never as a successful one.
+
+    What is *not* claimed here is a cross-process lock.  Two separate processes
+    appending to the same file rely on the platform's append-mode positioning for
+    atomicity of the write, not on this in-process lock; the guarantee asserted is
+    the in-process serialization plus the fsync that precedes the result.
     """
 
     line = canonical_json_bytes(event) + b"\n"
     try:
-        with open(journal_path, "ab") as handle:
-            handle.write(line)
+        with _APPEND_LOCK:
+            with open(journal_path, "ab") as handle:
+                handle.write(line)
+                handle.flush()
+                os.fsync(handle.fileno())
     except OSError as exc:
         raise JournalDependencyError(
-            "index service could not append its run report to the stated journal destination "
+            "index service could not durably append its run report to the stated journal destination "
             f"({type(exc).__name__}). A suppressed journal write error is not an acceptable degradation "
             "mode: the run fails, the index stays unpublished, and the commit intent is left in place for "
             "the recovery run that owns it.",
@@ -932,7 +1047,12 @@ def append_run_event(journal_path: Path, event: Mapping[str, Any]) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _build_candidate_manifest(request: IndexServiceRequest) -> IndexManifest:
+def _build_candidate_manifest(
+    request: IndexServiceRequest,
+    *,
+    docs_path: Path | None = None,
+    workspace_root: str | os.PathLike[str] | None = None,
+) -> IndexManifest:
     """Chunk under the explicit identity, then build and validate the sidecar.
 
     The chunker is the *effective* one: the request's closed option set goes
@@ -941,8 +1061,18 @@ def _build_candidate_manifest(request: IndexServiceRequest) -> IndexManifest:
     option that changes nothing cannot be recorded (C-23).  Every chunk identity is
     minted by the frozen chunker from the six stated limbs; nothing here mints,
     renumbers, or repairs one.
+
+    ``docs_path`` is the *scope* the parent view's documents were selected against.
+    It is threaded through so the selection is re-checked here, at the point the
+    documents are actually bound, and not only by the surface that gathered them: a
+    caller that assembled sources by hand must not be able to name a documents
+    directory and then supply documents from somewhere else.  ``workspace_root``
+    is only needed alongside ``docs_path``, because a parent document's
+    ``extracted_path`` is workspace-relative while ``docs_path`` is already resolved.
     """
 
+    if docs_path is not None:
+        _require_parent_documents_within(request, docs_path, workspace_root)
     chunker = MarkdownChunker.from_configuration(request.chunker_configuration)
     effective = chunker.configuration
     documents: list[dict[str, Any]] = []
@@ -1175,6 +1305,7 @@ def _refused(
     cause: Any,
     *,
     recovery_state: str | None,
+    workspace_root: str | os.PathLike[str],
 ) -> IndexServiceResult:
     """A refusal: the request, the configuration, the parent, or R1-R7 said no.
 
@@ -1187,7 +1318,22 @@ def _refused(
 
     code = _code_of(cause)
     try:
-        destination = request.journal_destination()
+        destination = request.journal_destination(workspace_root)
+    except IndexServiceValidationError as exc:
+        # The refusal *was* a request refusal, and it stays one: the request was
+        # refused on its own terms, so reporting FAILED here would blame the
+        # environment for a mistake the caller can see and fix.  What is lost is the
+        # journal record of the refusal, because the destination this run would have
+        # recorded it to is exactly the thing that is unusable.
+        return IndexServiceResult(
+            run_id=request.run_id,
+            outcome="REFUSED",
+            complete=False,
+            counts=zero,
+            codes=_dedupe((code, exc.code)),
+            journaled=False,
+            recovery_state=recovery_state,
+        )
     except JournalDependencyError as exc:
         return IndexServiceResult(
             run_id=request.run_id,
@@ -1220,6 +1366,7 @@ def _unverified(
     verification: Any,
     *,
     recovery_state: str | None,
+    workspace_root: str | os.PathLike[str],
 ) -> IndexServiceResult:
     """Check 6 did not match: an operational failure, not a partial index.
 
@@ -1245,13 +1392,17 @@ def _unverified(
             "verification_codes": tuple(verification.codes),
             "recovery_state": recovery_state,
         },
-        request.journal_destination(),
+        request.journal_destination(workspace_root),
         manifest=manifest,
     )
 
 
 def _failure(
-    request: IndexServiceRequest, zero: Counts, cause: IndexServiceError, *, recovery_state: str | None
+    request: IndexServiceRequest,
+    zero: Counts,
+    cause: IndexServiceError,
+    *,
+    recovery_state: str | None,
 ) -> IndexServiceResult:
     """An operational failure: the run reports no success, ever.
 
@@ -1564,6 +1715,215 @@ def _check_zero_counts(result: IndexServiceResult) -> None:
 # ---------------------------------------------------------------------------
 # Small, local helpers
 # ---------------------------------------------------------------------------
+
+
+def resolved_workspace_root(workspace_root: str | os.PathLike[str]) -> Path:
+    """The stated workspace root, resolved once, as the containment anchor.
+
+    Resolution happens **here** rather than at each comparison so that every
+    containment decision in this module is made against the same anchor, including
+    on Windows where a relative reference and an absolute one can spell the same
+    directory differently.
+    """
+
+    return Path(workspace_root).resolve()
+
+
+def _require_parent_documents_within(
+    request: IndexServiceRequest,
+    docs_path: Path,
+    workspace_root: str | os.PathLike[str],
+) -> None:
+    """Every document the parent view names must resolve inside ``docs_path``.
+
+    ``docs_path`` has to decide something, and what it decides is the *scope* of
+    this run's sources: a documents directory that names none of the parent's
+    documents, or only some of them, is not the directory this run was told to
+    index.  Both are refused, and the reason names which documents fell outside,
+    because "partly in scope" is the case a caller silently gets wrong.
+
+    The references are workspace-relative (that is what ``extracted_path`` means),
+    so each is joined to the workspace root and then required to land inside
+    ``docs_path``.  The decision is made on resolved paths, so a document reached
+    through a link out of the documents directory is refused the same way a ``..``
+    reference is.
+    """
+
+    root = resolved_workspace_root(workspace_root)
+    outside = [
+        str(position)
+        for position, record in enumerate(request.parent_view.get("documents") or ())
+        if isinstance(record, Mapping)
+        and isinstance(record.get("extracted_path"), str)
+        and not _resolves_within(
+            require_contained(
+                root / record["extracted_path"],
+                docs_path,
+                _parent_field(position, "extracted_path"),
+            ),
+            docs_path,
+        )
+    ]
+    if outside:
+        raise IndexServiceValidationError(
+            f"index service refuses this run: {len(outside)} document(s) named by the accepted parent view "
+            f"(position(s) {', '.join(outside)}) do not resolve inside the stated docs_path "
+            f"{str(docs_path)!r}. A documents directory that does not cover the accepted parent is not the "
+            "directory this run was given; indexing part of a parent would report a corpus the parent never "
+            "admitted.",
+            field="docs_path",
+        )
+
+
+def _parent_field(position: Any, name: str) -> str:
+    return f"parent_view.documents.{position}.{name}"
+
+
+def _resolves_within(resolved: Path, root: Path) -> bool:
+    return resolved == root or resolved.is_relative_to(root)
+
+
+def _refuse_escaping_reference(raw: str, field: str) -> None:
+    """Refuse a reference that is absolute or escaping, **before** resolution.
+
+    Checking the shape first matters for two reasons.  It keeps the refusal a
+    property of the request rather than of whatever the filesystem answered -- a
+    path that does not exist cannot be discovered to be inside the workspace by
+    walking it, and a path that does can be discovered to be outside only after
+    touching disk.  And it covers the references ``Path.resolve()`` silently
+    normalizes instead of rejecting: ``a//b`` and ``./a`` are cleaned up silently,
+    so by the time a normalized path is examined the segment that named the problem
+    is gone.
+    """
+
+    if _ABSOLUTE_PATH_PATTERN.match(raw) or Path(raw).is_absolute():
+        raise IndexServiceValidationError(
+            f"index service refuses {field} {raw!r}: it is an absolute or drive-relative reference, and only a "
+            "workspace-relative reference can be checked for containment. Stating a whole filesystem path is "
+            "not the same as stating which part of the workspace this run may write to.",
+            field=field,
+        )
+    if _TRAVERSAL_PATTERN.search(raw) or ".." in Path(raw).parts:
+        raise IndexServiceValidationError(
+            f"index service refuses {field} {raw!r}: it contains a '..' segment, so the directory it names is "
+            "a function of where the caller happened to invoke this service rather than a fixed location "
+            "inside the workspace.",
+            field=field,
+        )
+    if raw == ".":
+        # The one reference that *is* the workspace root, which is a legitimate thing
+        # for ``docs_path`` to name.  It is unambiguous -- no other spelling of the
+        # root exists relative to the root -- so it is allowed, while the same
+        # segment appearing *inside* a longer reference stays refused below.
+        return
+    if any(part in (".", "") for part in re.split(r"[\\/]", raw)):
+        raise IndexServiceValidationError(
+            f"index service refuses {field} {raw!r}: it names an empty or '.' path segment. A reference is "
+            "either a workspace-relative directory or it is not one, and the spelling with redundant "
+            "separators is a different reference that would resolve to the same file.",
+            field=field,
+        )
+
+
+def require_contained(candidate: Path, root: Path, field: str) -> Path:
+    """Return ``candidate`` resolved, or refuse it for leaving ``root``.
+
+    Both sides are already resolved by the caller, so this compares like with like:
+    on Windows ``workspace\\run-reports`` and ``workspace/./run-reports`` are the
+    same directory, and a comparison that mixed spellings would let a real escape
+    through or refuse a legitimate destination.
+    """
+
+    resolved = candidate.resolve()
+    if resolved != root and not resolved.is_relative_to(root):
+        raise IndexServiceValidationError(
+            f"index service refuses {field}: it resolves to {str(resolved)!r}, which is outside the stated "
+            f"workspace root {str(root)!r}. A run may only read and write inside the workspace it was given, "
+            "so a reference that escapes it is refused rather than honoured -- including when it leaves the "
+            "workspace only through a link.",
+            field=field,
+        )
+    return resolved
+
+
+def _workspace_relative_destination(raw: Any, root: Path, *, field: str) -> Path:
+    """Lexical shape check, then join to ``root``, then resolved containment."""
+
+    text = str(raw).strip()
+    if not text:
+        raise IndexServiceValidationError(
+            f"index service refuses {field}: it is stated but empty. An empty reference names no directory.",
+            field=field,
+        )
+    _refuse_escaping_reference(text, field)
+    return require_contained(root / text, root, field)
+
+
+def _refuse_canonical_audit_ledger(destination: Path, root: Path) -> None:
+    """Refuse the adapter-owned canonical audit ledger (**G-9**).
+
+    The ledger belongs to the adapter's audit layer.  Writing the kit's own event
+    into it would forge a kit-authored row in someone else's ledger, and reading it
+    back would later be reported as adapter provenance -- so the prohibition is
+    enforced, not documented: this kit's events go to their own destination beneath
+    the workspace.
+
+    The comparison is on the resolved, workspace-relative parts rather than on the
+    raw string so that ``run-reports\\..\\audit\\journal.jsonl`` and
+    ``./audit/journal.jsonl`` are both refused, and it folds case on Windows because
+    that filesystem does.
+    """
+
+    try:
+        relative = destination.relative_to(root)
+    except ValueError:  # pragma: no cover - unreachable: containment was enforced above
+        return
+    parts = tuple(part.casefold() if os.name == "nt" else part for part in relative.parts)
+    if parts == tuple(part.casefold() if os.name == "nt" else part for part in _CANONICAL_AUDIT_LEDGER):
+        raise IndexServiceValidationError(
+            f"index service refuses {field_relative(destination, root)!r}: that is the canonical audit ledger "
+            "audit/journal.jsonl, which belongs to the workspace adapter, not to this kit. No code in "
+            "scholar-rag-kit writes the adapter's ledger -- a kit-authored row there would be "
+            "indistinguishable from adapter provenance -- so this destination is refused by construction. "
+            "This run's own event goes to its own path inside the workspace, such as "
+            "run-reports/rag-index.jsonl.",
+            field="journal_path",
+        )
+
+
+def field_relative(destination: Path, root: Path) -> str:
+    """The workspace-relative spelling of ``destination``, for a refusal message."""
+
+    try:
+        return str(destination.relative_to(root))
+    except ValueError:  # pragma: no cover - defensive: only reached from a refusal path
+        return str(destination)
+
+
+def require_extracted_documents_directory(raw: Any, root: Path) -> Path:
+    """Resolve and validate ``docs_path``: contained, present, and a directory.
+
+    Existence is checked here rather than being left to the first read, so that
+    "the stated documents directory is not there" is reported against ``docs_path``
+    instead of surfacing as a per-document read failure that names the wrong field
+    and hides the caller's actual mistake.
+    """
+
+    docs = _workspace_relative_destination(raw, root, field="docs_path")
+    if not docs.exists():
+        raise IndexServiceValidationError(
+            f"index service refuses docs_path {field_relative(docs, root)!r}: no such directory in the stated "
+            f"workspace {str(root)!r}. A documents directory that is not there is a request the caller can "
+            "correct, so it is refused here rather than becoming an empty successful index.",
+            field="docs_path",
+        )
+    if not docs.is_dir():
+        raise IndexServiceValidationError(
+            f"index service refuses docs_path {field_relative(docs, root)!r}: it exists but is not a directory. "
+            "This field names the directory of extracted documents, not one file.",
+            field="docs_path",
+        )
+    return docs
 
 
 def _strict_sequences(raw: Mapping[str, Any], model_type: type[BaseModel]) -> dict[str, Any]:
