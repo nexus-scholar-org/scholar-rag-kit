@@ -371,6 +371,78 @@ def test_cli_refuses_a_docs_path_covering_no_parent_document(tmp_path):
     assert result.exit_code == 2, "an unrelated directory decides nothing about this parent's documents"
 
 
+def _partially_covered_workspace(tmp_path, name):
+    """A workspace whose parent names four documents and whose docs dir holds two.
+
+    Positions 0 and 2 are reachable inside ``scoped/``; positions 1 and 3 are not,
+    and they sit in two different directories, so the refusal cannot be satisfied by
+    naming a single parent path.
+    """
+
+    root = tmp_path / name
+    (root / "scoped").mkdir(parents=True, exist_ok=True)
+    view = json.loads(_admitted_workspace(tmp_path, f"{name}-seed")[1].read_text(encoding="utf-8"))
+    records = []
+    for position in range(4):
+        document_id = "DOC-" + str(position + 1) * 32
+        relative = f"loose/{document_id}.md" if position in (1, 3) else f"scoped/{document_id}.md"
+        (root / relative).parent.mkdir(parents=True, exist_ok=True)
+        (root / relative).write_text(f"# Document {position}\n\nA claim number {position}.\n", encoding="utf-8")
+        records.append(
+            {
+                "document_id": document_id,
+                "study_id": "STU-" + "4" * 32,
+                "extracted_path": relative,
+                "extracted_content_sha256": "sha256:" + str(position + 1) * 64,
+                "extraction_method": "DETERMINISTIC_RULE",
+            }
+        )
+    view["documents"] = records
+    view_path = tmp_path / f"parent-view-{name}-partial.json"
+    view_path.write_text(json.dumps(view), encoding="utf-8")
+    return root, view_path
+
+
+def test_cli_partial_docs_path_reasoning_names_docs_path_count_and_offsets(tmp_path):
+    """The CLI surface carries the same actionable refusal as the Python API.
+
+    The command is a surface: it must not re-derive the scope decision, so the
+    reasoning it prints is the service's own -- ``docs_path`` named, the count, and
+    every offending offset.  A surface that resolved the same mismatch itself would
+    most plausibly label it "the workspace root", which is not what was misconfigured
+    and sends the operator to fix a root that is fine.
+    """
+
+    root, view_path = _partially_covered_workspace(tmp_path, "ws-partial")
+
+    human = runner.invoke(
+        app,
+        _index_surface_args(tmp_path, root / "scoped", view_path, _kit_journal(root), workspace_root=root),
+    )
+    # Rich wraps the reason line at the console width, so the assertions read the
+    # unwrapped text: what the operator sees is the same sentence, folded.
+    text = " ".join(_plain(human.output).split())
+
+    assert human.exit_code == 2, "a documents directory covering only some of the parent is refused"
+    assert "REFUSED" in text and "VALIDATION_ERROR" in text
+    assert "docs_path" in text, "the operator is told which option to turn"
+    assert "workspace root" not in text, "docs_path is not the workspace root"
+    assert "2 document(s)" in text, "the count is the real number of offenders"
+    assert "position(s) 1, 3" in text, "every offending offset is located"
+    assert not (root / "run-reports" / "rag-index.jsonl").exists(), "nothing was indexed from a mis-scoped run"
+
+    as_json = runner.invoke(
+        app,
+        _index_surface_args(tmp_path, root / "scoped", view_path, _kit_journal(root), workspace_root=root)
+        + ["--format", "json"],
+    )
+    assert as_json.exit_code == 2
+    envelope = json.loads(_plain(as_json.output))
+    assert envelope["outcome"] == "REFUSED", "the machine surface carries the same verdict"
+    assert "VALIDATION_ERROR" in envelope["codes"]
+    assert envelope["counts"] == {"accepted_documents": 0, "rejected_documents": 0, "visible_chunks": 0}
+
+
 def test_cli_binds_a_relative_journal_reference_to_the_workspace_not_the_cwd(tmp_path, monkeypatch, offline_embedder):
     """F1 on the CLI surface: the working directory is not part of a destination.
 

@@ -2290,6 +2290,94 @@ def test_t90_a_docs_path_covering_only_some_parent_documents_is_refused(tmp_path
     assert result.codes == ("VALIDATION_ERROR",)
     assert result.sidecar_path is None, "nothing was indexed from a mis-scoped request"
     assert [event["action"] for event in t90_events(root)] == [ACTION_RUN_REJECTED]
+    # The refusal has to be actionable. ``index_workspace`` reports a refusal as a
+    # typed result with no free text in it, so the wording is asserted where it is
+    # raised -- on the check the service and the CLI both call -- and the typed
+    # result above is asserted separately above.
+    with pytest.raises(IndexServiceValidationError) as raised:
+        index_service.require_parent_documents_within_docs_path(
+            view["documents"],
+            docs_path=(root / "scoped").resolve(),
+            workspace_root=root,
+        )
+    reasoning = str(raised.value)
+    assert raised.value.field == "docs_path", "the refusal names the option that was misconfigured"
+    # The knob, not the workspace root: a documents directory that covers only some
+    # of the parent is a wrong ``docs_path``, and the workspace root is fine.
+    assert "docs_path" in reasoning, "the reason must name docs_path, the option actually misconfigured"
+    assert "workspace root" not in reasoning, "docs_path is not the workspace root; do not send the caller there"
+    assert "1 document(s)" in reasoning, "the reason must count the documents that fell outside"
+    assert "position(s) 1" in reasoning, "the reason must locate the offending record in the parent view"
+
+
+def test_t90_a_docs_path_reasoning_names_every_offset_it_counted(tmp_path: Path):
+    """Two documents out of scope: the reason counts 2 and lists both offsets.
+
+    This is the assertion that makes the count load-bearing.  Reporting only the
+    first offender while still claiming to have counted would leave a caller with
+    a scope mismatch they fix once and hit again; and an aggregation branch that
+    can never be reached (because the per-document check raises first) is a branch
+    that is never exercised.  Three documents out of scope with positions 1 and 3
+    out of scope is what separates "counts something" from "counts and locates
+    every one of them" -- a run that reported `2 document(s) at position(s) 1`
+    would pass a count-only check and fail here.
+    """
+
+    root = t90_workspace_root(tmp_path)
+    # Positions 0, 2 are inside docs_path; 1 and 3 are not, and sit in different
+    # directories so the refusal cannot be satisfied by matching one parent path.
+    outside_paths = ["loose/one.md", "other/two.md"]
+    records = []
+    sources = []
+    for position, document_id in enumerate(["DOC-" + str(n) * 32 for n in (1, 2, 3, 4)]):
+        text = f"# Document {position}\n\nA claim number {position} for this study.\n"
+        if position in (1, 3):
+            relative = outside_paths[(position - 1) // 2]
+        else:
+            relative = f"scoped/{document_id}.md"
+        (root / relative).parent.mkdir(parents=True, exist_ok=True)
+        (root / relative).write_text(text, encoding="utf-8")
+        records.append(
+            {
+                "document_id": document_id,
+                "study_id": T90_STUDY,
+                "extracted_path": relative,
+                "extracted_content_sha256": t90_fingerprint(text),
+                "extraction_method": "DETERMINISTIC_RULE",
+            }
+        )
+        sources.append(t90_source(document_id, text=text, extracted_path=relative))
+    (root / "scoped").mkdir(exist_ok=True)
+    view = dict(T90_PARENT_VIEW)
+    view["documents"] = records
+
+    result = index_workspace(
+        t90_request(root, sources=tuple(sources), parent_view=view, docs_path="scoped"),
+        backend=T90Store(),
+        reader=T90Store(),
+        embedder=t90_embedder,
+        workspace_root=root,
+    )
+
+    assert result.outcome == "REFUSED", "two of four parent documents are outside the stated docs directory"
+    assert result.codes == ("VALIDATION_ERROR",)
+    assert result.sidecar_path is None, "nothing was indexed from a mis-scoped request"
+
+    with pytest.raises(IndexServiceValidationError) as raised:
+        index_service.require_parent_documents_within_docs_path(
+            records, docs_path=(root / "scoped").resolve(), workspace_root=root
+        )
+    reasoning = str(raised.value)
+    assert "docs_path" in reasoning, "the reason must name docs_path, the option actually misconfigured"
+    assert "workspace root" not in reasoning, "docs_path is not the workspace root; do not send the caller there"
+    assert "2 document(s)" in reasoning, "the count must be the real number of offenders, not the first one"
+    assert "position(s) 1, 3" in reasoning, "every offset that was counted must also be located"
+    # Positions 0 and 2 resolve inside docs_path, so the listed offsets are exactly
+    # {1, 3} -- a count of 2 naming 0 and 2 would pass the two assertions above while
+    # locating documents that are in scope.
+    listed = re.search(r"position\(s\) ([0-9, ]+?) in ", reasoning)
+    assert listed is not None, "the reason must list the offending positions"
+    assert {int(offset) for offset in listed.group(1).split(",")} == {1, 3}
 
 
 # -- durability: one append, serialized, flushed, fsync'd before the result ---

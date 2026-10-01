@@ -36,8 +36,8 @@ from scholar_rag.index_service import (
     IndexServiceValidationError,
     exit_code_for,
     index_workspace,
-    require_contained,
     require_extracted_documents_directory,
+    require_parent_documents_within_docs_path,
     resolved_workspace_root,
     store_open_result,
 )
@@ -411,9 +411,12 @@ def _sources_from(
     The selection is also **scoped to ``docs_path``**.  That positional argument
     names the directory of extracted documents, so it decides *which* files this run
     may read: a document the accepted parent names that resolves outside it is
-    refused here, naming the position, rather than being read anyway because the
-    parent mentioned it.  The parent is what makes a document eligible;
-    ``docs_path`` is what makes it reachable by this run, and both have to hold.
+    refused here, by the service's own
+    :func:`~scholar_rag.index_service.require_parent_documents_within_docs_path`,
+    naming ``docs_path``, how many documents fell outside it, and where each one is,
+    rather than being read anyway because the parent mentioned it.  The parent is
+    what makes a document eligible; ``docs_path`` is what makes it reachable by this
+    run, and both have to hold.
     """
 
     root = workspace_root
@@ -429,11 +432,19 @@ def _sources_from(
             "eligible.",
             field="parent_view.documents",
         )
-    # The reference is resolved against the **stated workspace root**, because that
-    # is what "workspace-relative" means: ``extracted/x.md`` is the same reference
-    # whichever directory the caller happened to invoke from. Resolving it against
-    # the process's working directory instead would make the same request read a
-    # different file -- the CWD-dependence this packet removes.
+    # Each reference below is resolved against the **stated workspace root**, because
+    # that is what "workspace-relative" means: ``extracted/x.md`` is the same
+    # reference whichever directory the caller happened to invoke from. Resolving it
+    # against the process's working directory instead would make the same request
+    # read a different file -- the CWD-dependence this packet removes.
+    #
+    # The whole scope is checked **before** the first file is read or bound, through
+    # the service's own function, so this surface and the Python API refuse the same
+    # parent view with the same reasoning -- naming ``docs_path``, the count, and
+    # every offending position rather than the first one alone.  Checking per record
+    # inside the loop below would read and bind the documents ahead of the offender
+    # before anything was refused.
+    require_parent_documents_within_docs_path(records, docs_path=docs_root, workspace_root=workspace_root)
     sources: list[IndexedSource] = []
     for position, record in enumerate(records):
         if not isinstance(record, Mapping):
@@ -454,17 +465,13 @@ def _sources_from(
                 "not a workspace-relative reference, so the file it names is not one this run can read.",
                 field=f"parent_view.documents.{position}.extracted_path",
             )
-        # In scope means the document resolves *inside* the stated documents
-        # directory, decided on resolved paths so a link out of it is caught here
-        # too.  This is the check that makes ``docs_path`` load-bearing: without it
-        # the argument is accepted, validated as a directory, and then ignored in
-        # favour of wherever each parent record happens to point.
-        resolved_source = require_contained(
-            (root / relative).resolve(),
-            docs_root,
-            f"parent_view.documents.{position}.extracted_path",
-        )
-        source_file = resolved_source
+        # The scope of this binding was already decided, for every record at once,
+        # by ``require_parent_documents_within_docs_path`` above: the resolved path
+        # below is inside ``docs_root`` because anything else would have refused the
+        # run before this loop began.  So this is not a re-check with a second
+        # wording -- it is the resolution the read needs, on resolved paths so a link
+        # out of the documents directory was already caught by that decision.
+        source_file = (root / relative).resolve()
         try:
             text = source_file.read_text(encoding="utf-8")
         except OSError as exc:

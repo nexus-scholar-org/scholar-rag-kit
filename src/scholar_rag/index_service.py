@@ -1734,49 +1734,71 @@ def _require_parent_documents_within(
     docs_path: Path,
     workspace_root: str | os.PathLike[str],
 ) -> None:
+    """Refuse when the parent view names documents outside ``docs_path``."""
+
+    require_parent_documents_within_docs_path(
+        request.parent_view.get("documents") or (),
+        docs_path=docs_path,
+        workspace_root=workspace_root,
+    )
+
+
+def require_parent_documents_within_docs_path(
+    records: Sequence[Any],
+    *,
+    docs_path: Path,
+    workspace_root: str | os.PathLike[str],
+) -> None:
     """Every document the parent view names must resolve inside ``docs_path``.
 
     ``docs_path`` has to decide something, and what it decides is the *scope* of
     this run's sources: a documents directory that names none of the parent's
     documents, or only some of them, is not the directory this run was told to
-    index.  Both are refused, and the reason names which documents fell outside,
-    because "partly in scope" is the case a caller silently gets wrong.
+    index.  Both are refused.
+
+    The refusal is written for the operator who has to act on it, so it answers
+    three questions at once: **which knob** is wrong (``docs_path`` -- not the
+    workspace root, which is not what a mis-scoped run misconfigured), **how
+    many** of the parent's documents fell outside it, and **where** they are in
+    the parent view.  Every offending position is collected before the refusal is
+    raised, because a caller who fixes one document at a time has to be told how
+    many there are; the aggregation is what makes that possible, and it is why
+    the containment decision here does not go through ``require_contained``.
 
     The references are workspace-relative (that is what ``extracted_path`` means),
     so each is joined to the workspace root and then required to land inside
     ``docs_path``.  The decision is made on resolved paths, so a document reached
     through a link out of the documents directory is refused the same way a ``..``
-    reference is.
+    reference is.  Records that are not mappings, or that name no
+    ``extracted_path``, are left to the surface that assembles the sources to
+    refuse by name: this check answers the scope question, not the shape one.
+
+    Both surfaces call this one function -- the service here, and the CLI before
+    it binds a single file -- so the two cannot answer the same parent view with
+    different reasoning (**E3-NEG-040** / **E3-NEG-041**).
     """
 
     root = resolved_workspace_root(workspace_root)
     outside = [
-        str(position)
-        for position, record in enumerate(request.parent_view.get("documents") or ())
+        (position, (root / record["extracted_path"]).resolve())
+        for position, record in enumerate(records)
         if isinstance(record, Mapping)
         and isinstance(record.get("extracted_path"), str)
-        and not _resolves_within(
-            require_contained(
-                root / record["extracted_path"],
-                docs_path,
-                _parent_field(position, "extracted_path"),
-            ),
-            docs_path,
-        )
+        and not _resolves_within((root / record["extracted_path"]).resolve(), docs_path)
     ]
-    if outside:
-        raise IndexServiceValidationError(
-            f"index service refuses this run: {len(outside)} document(s) named by the accepted parent view "
-            f"(position(s) {', '.join(outside)}) do not resolve inside the stated docs_path "
-            f"{str(docs_path)!r}. A documents directory that does not cover the accepted parent is not the "
-            "directory this run was given; indexing part of a parent would report a corpus the parent never "
-            "admitted.",
-            field="docs_path",
-        )
-
-
-def _parent_field(position: Any, name: str) -> str:
-    return f"parent_view.documents.{position}.{name}"
+    if not outside:
+        return
+    positions = ", ".join(str(position) for position, _ in outside)
+    raise IndexServiceValidationError(
+        f"index service refuses docs_path {str(docs_path)!r}: the accepted parent view names "
+        f"{len(outside)} document(s) at position(s) {positions} in 'documents' that do not resolve inside "
+        f"it. The first of those resolves to {str(outside[0][1])!r}, which is outside that directory. "
+        "A documents directory that does not cover the accepted parent is not the directory this run was "
+        "given; indexing part of a parent would report a corpus the parent never admitted. Point "
+        "docs_path at the directory holding these documents, or remove the records the parent did not "
+        "admit.",
+        field="docs_path",
+    )
 
 
 def _resolves_within(resolved: Path, root: Path) -> bool:
