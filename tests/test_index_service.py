@@ -10,13 +10,28 @@ Each test is named for the property it asserts so a failure reads as a broken
 guarantee rather than a broken fixture.
 """
 
+import ast
+import inspect
 import json
+import os
+import re
+import threading
+from collections.abc import Callable, Sequence
 from pathlib import Path
+from typing import Any
 
 import pytest
 from pydantic import ValidationError
+from typer.testing import CliRunner
 
-from scholar_rag.chunker import IDENTITY_LIMB_KEYS
+from scholar_rag import cli, index_service, index_verifier, recovery, replacement
+from scholar_rag.chunker import IDENTITY_LIMB_KEYS, text_fingerprint
+from scholar_rag.cli import app
+from scholar_rag.index_manifest import (
+    MANIFEST_CODE_VOCABULARY,
+    Counts,
+    stage_i_artifact_checksum,
+)
 from scholar_rag.index_models import (
     REQUIRED_REQUEST_FIELDS,
     BackendIdentityMismatchError,
@@ -26,7 +41,26 @@ from scholar_rag.index_models import (
     IndexRequestError,
     WorkspaceManifestUnreadableError,
 )
+from scholar_rag.index_service import (
+    ACTION_RUN_BUILT,
+    ACTION_RUN_REJECTED,
+    INDEX_SERVICE_EXIT_CODES,
+    INDEX_SERVICE_OUTCOMES,
+    JOURNAL_DEPENDENCY_CODE,
+    RUN_REPORT_ACTIONS,
+    RUN_REPORT_EVENT_TYPE,
+    UNUSABLE_TEXT_CODE,
+    IndexedSource,
+    IndexServiceRequest,
+    IndexServiceResult,
+    IndexServiceValidationError,
+    exit_code_for,
+    index_workspace,
+    store_open_result,
+)
+from scholar_rag.index_verifier import BACKEND_VERIFICATION_CODES, VISIBLE_GENERATION_KEY, VisibleRow
 from scholar_rag.indexer import ScholarIndexer
+from scholar_rag.replacement import REPLACEMENT_CODES, CandidateChunk, ReplacementBackend, StagedRow
 
 BOUND_MODEL = "all-MiniLM-L6-v2"
 COLLECTION = "svc_collection"
@@ -653,3 +687,1840 @@ def test_a_type_violation_is_a_pydantic_error_not_the_typed_error(bad_value):
 def test_a_type_violation_in_a_limb_is_not_converted_to_a_string():
     with pytest.raises(ValidationError):
         IndexDocumentRequest(**_fields(parent_artifact_sha256=12345))
+
+
+# =============================================================================
+# E3-T-90 (B1): one typed service behind every surface
+# =============================================================================
+#
+# The battery below is about *parity and honesty at the service boundary*, not
+# about chunking, sidecar construction, replacement, or verification: those are
+# T-40/T-50/T-60/T-80's own batteries and are not restated here. What is new is
+# that there is now ONE function both surfaces call, and these tests hold it to
+# the claims E3-008, E3-011, C-24, C-33, E3-NEG-025, E3-NEG-040, and
+# E3-NEG-041 make about it.
+#
+# Every test drives the public surface only -- index_workspace, the CLI command,
+# and the models -- so a guarantee that held only by reaching inside the
+# implementation would fail here.
+
+T90_DIMENSION = 8
+T90_COMMIT = "c89b68f0d35173082a03b8c6b228e84381271185"
+T90_CREATED_AT = "2026-09-29T00:00:00Z"
+T90_RUN = "RUN-" + "a" * 32
+T90_WORKSPACE = "WSP-" + "0" * 32
+T90_STUDY = "STU-" + "4" * 32
+T90_DOCUMENT = "DOC-" + "1" * 32
+T90_UNUSABLE = "DOC-" + "9" * 32
+T90_COLLECTION = "nexus-evidence-t90"
+T90_PARENT_SHA = "sha256:" + "1" * 64
+T90_CORPUS = "sha256:" + "3" * 64
+T90_PROTOCOL = "sha256:" + "2" * 64
+T90_SPACE = "cosine"
+
+T90_CHUNKER_CONFIG = {
+    "heading_levels": [1, 2, 3],
+    "max_chunk_chars": 1200,
+    "min_chunk_chars": 200,
+    "normalize_whitespace": True,
+    "overlap_chars": 120,
+    "sentence_split_pattern": r"(?<=[.!?])\s+",
+    "strip_frontmatter": True,
+}
+
+# Real structural text, long enough for the frozen chunker to mint more than one
+# chunk.
+T90_TEXT = "\n".join(
+    [
+        "---",
+        "title: a study",
+        "---",
+        "",
+        "# Methods",
+        "",
+        "We ran the study as described. " * 12,
+        "",
+        "## Detail",
+        "",
+        "Further detail is reported here. " * 12,
+    ]
+)
+
+T90_PARENT_VIEW = {
+    "artifact_id": "ART-" + "1" * 32,
+    "artifact_type": "document_manifest",
+    "sha256": T90_PARENT_SHA,
+    "workspace_id": T90_WORKSPACE,
+    "protocol_fingerprint": T90_PROTOCOL,
+    "corpus_fingerprint": T90_CORPUS,
+}
+
+
+def t90_fingerprint(text: str) -> str:
+    return text_fingerprint(text)
+
+
+def t90_parent_view(*documents: str) -> dict:
+    """A parent view admitting *documents*, each bound to its own extracted text.
+
+    Built through the same ``text_fingerprint`` the service records, so the
+    eligibility join agrees by construction and a negative test can break exactly
+    one limb.
+    """
+
+    view = dict(T90_PARENT_VIEW)
+    view["documents"] = [
+        {
+            "document_id": document_id,
+            "study_id": T90_STUDY,
+            "extracted_path": f"extracted/{document_id}.md",
+            "extracted_content_sha256": t90_fingerprint(T90_TEXT if document_id != T90_UNUSABLE else "   "),
+            "extraction_method": "DETERMINISTIC_RULE",
+        }
+        for document_id in documents
+    ]
+    return view
+
+
+def t90_source(
+    document_id: str,
+    *,
+    text: str | None = None,
+    extracted_path: str | None = None,
+) -> IndexedSource:
+    body = T90_TEXT if text is None else text
+    return IndexedSource(
+        request=IndexDocumentRequest(
+            workspace_id=T90_WORKSPACE,
+            study_id=T90_STUDY,
+            document_id=document_id,
+            parent_artifact_id=T90_PARENT_VIEW["artifact_id"],
+            parent_artifact_sha256=T90_PARENT_SHA,
+            extracted_content_sha256=t90_fingerprint(body),
+            backend_provider="test-provider",
+            backend_model="test-embedder-v1",
+            collection=T90_COLLECTION,
+            run_id=T90_RUN,
+        ),
+        extracted_text=body,
+        extracted_path=f"extracted/{document_id}.md" if extracted_path is None else extracted_path,
+        extraction_method="DETERMINISTIC_RULE",
+    )
+
+
+def t90_request(root: Path, /, **overrides) -> IndexServiceRequest:
+    """A valid request for one document, with *overrides* applied as fields."""
+
+    fields = {
+        "run_id": T90_RUN,
+        "created_at": T90_CREATED_AT,
+        "sources": (t90_source(T90_DOCUMENT),),
+        "parent_view": t90_parent_view(T90_DOCUMENT),
+        "chunker_configuration": dict(T90_CHUNKER_CONFIG),
+        "backend_type": "chroma",
+        "collection_name": T90_COLLECTION,
+        "storage_schema_version": "chroma-2",
+        "hnsw_space": T90_SPACE,
+        "embedder_provider": "test-provider",
+        "embedder_model": "test-embedder-v1",
+        "embedder_dimension": T90_DIMENSION,
+        "embedder_normalize_embeddings": True,
+        "embedder_distance_metric": T90_SPACE,
+        "producer_version": "0.2.0",
+        "producer_commit": T90_COMMIT,
+        # Workspace-relative, as the service now requires of both destinations.
+        "journal_path": T90_KIT_JOURNAL,
+        "docs_path": T90_DOCS,
+    }
+    fields.update(overrides)
+    return IndexServiceRequest(**fields)
+
+
+def t90_embedder(texts: Sequence[str]) -> list[list[float]]:
+    """A deterministic, offline embedder of the declared dimension."""
+
+    return [
+        [float((sum(ord(character) for character in text) + index) % 11) for index in range(T90_DIMENSION)]
+        for text in texts
+    ]
+
+
+class T90Store(ReplacementBackend):
+    """One pointer-mode store answering BOTH surfaces: writes and reads.
+
+    Stands in for any store T-60 and T-80 admit, with mechanics deliberately not
+    Chroma's (a frozenset pointer, a plain dict of rows) so the assertions below
+    are about the service's composition and not about a particular store.
+    """
+
+    mode = "pointer"
+
+    def __init__(self) -> None:
+        self.pointer: frozenset[str] = frozenset()
+        self.generation: str | None = None
+        self.staged: dict[str, dict[str, StagedRow]] = {}
+        self.texts: dict[str, str] = {}
+
+    # -- the write half, as ReplacementBackend ---------------------------
+
+    def stage(self, run_id: str, records: Sequence[CandidateChunk]) -> None:
+        self.staged[run_id] = {
+            record.chunk_id: StagedRow(
+                row_key=f"{run_id}#{record.chunk_id}",
+                chunk_id=record.chunk_id,
+                document_id=record.document_id,
+                embedding_dimension=None,
+            )
+            for record in records
+        }
+        self.texts.update({record.chunk_id: record.text for record in records})
+
+    def embed_staged(self, run_id: str, embed: Callable[[Sequence[str]], Sequence[Sequence[float]]]) -> None:
+        for row in self.staged[run_id].values():
+            object.__setattr__(row, "embedding_dimension", T90_DIMENSION)
+
+    def staged_rows(self, run_id: str) -> Sequence[StagedRow]:
+        return list(self.staged.get(run_id, {}).values())
+
+    def switch_visibility(self, run_id: str, chunk_ids: Sequence[str], mode: str) -> None:
+        self.pointer = frozenset(chunk_ids)
+        self.generation = run_id
+
+    def remove_obsolete(self, document_ids: Sequence[str], keep_ids: Sequence[str]) -> int:
+        return 0
+
+    # -- the read half, as VerifiableBackend ------------------------------
+
+    def visible_ids(self) -> Sequence[str]:
+        return sorted(self.pointer)
+
+    def visible_count(self) -> int:
+        return len(self.pointer)
+
+    def visible_rows(self) -> Sequence[VisibleRow]:
+        return tuple(
+            VisibleRow(
+                row_key=f"{self.generation}#{chunk_id}",
+                chunk_id=chunk_id,
+                document_id=row.document_id,
+                study_id=T90_STUDY,
+                embedding_dimension=T90_DIMENSION,
+                stored_text=self.texts.get(chunk_id, ""),
+            )
+            for chunk_id, row in self.staged.get(self.generation or "", {}).items()
+            if chunk_id in self.pointer
+        )
+
+    def read_collection_metadata(self) -> Any:
+        return {"hnsw:space": T90_SPACE, VISIBLE_GENERATION_KEY: self.generation}
+
+
+#: This kit's own event destination, **relative to the workspace root**.
+#:
+#: **G-9**: the canonical ledger ``audit/journal.jsonl`` belongs to the workspace
+#: adapter and the service refuses it by construction, so no healthy-path fixture
+#: may point a run at it.  The kit writes its events here instead.
+T90_KIT_JOURNAL = "run-reports/rag-index.jsonl"
+
+#: The parent view binds each document to ``extracted/<id>.md``, so the documents
+#: directory a healthy run states is ``extracted``.
+T90_DOCS = "extracted"
+
+
+def t90_workspace_root(tmp_path: Path, name: str = "ws") -> Path:
+    """A workspace root with an existing (empty) audit directory and docs directory.
+
+    Both exist on purpose.  ``audit/`` because every journal-path test below must
+    prove the service *refuses* to find it, which is only a claim if there was
+    something there to find.  ``extracted/`` because ``docs_path`` is load-bearing:
+    it must exist, be a directory, and cover every document the parent view names.
+    ``exist_ok`` because a test that breaks a path leaves a *directory* where the
+    file belongs, and a second fixture call in the same test must not fail on its
+    own setup.
+    """
+
+    root = tmp_path / name
+    (root / "audit").mkdir(parents=True, exist_ok=True)
+    (root / T90_DOCS).mkdir(parents=True, exist_ok=True)
+    # The kit's own destination directory exists for the same reason ``audit/``
+    # does: the service appends to a stated path and never creates the directory
+    # tree for the caller, so a missing parent is the environment's business and is
+    # reported as the typed ``DEPENDENCY_ERROR`` it is.
+    (root / "run-reports").mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def t90_run(root: Path, /, store: T90Store | None = None, **overrides) -> IndexServiceResult:
+    """Drive the service once over a healthy store and return its typed result."""
+
+    backend = T90Store() if store is None else store
+    return index_workspace(
+        t90_request(root, **overrides),
+        backend=backend,
+        reader=backend,
+        embedder=t90_embedder,
+        workspace_root=root,
+    )
+
+
+def t90_journal_path(root: Path) -> Path:
+    """This kit's own event file inside ``root`` -- never the adapter's ledger."""
+
+    return root / "run-reports" / "rag-index.jsonl"
+
+
+def t90_events(root: Path) -> list[dict]:
+    journal = t90_journal_path(root)
+    if not journal.exists():
+        return []
+    return [json.loads(line) for line in journal.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
+# -- the four outcomes exist, and are reachable ------------------------------
+
+
+def test_t90_a_healthy_run_reports_a_typed_success(tmp_path: Path):
+    result = t90_run(t90_workspace_root(tmp_path))
+
+    assert result.outcome == "SUCCESS"
+    assert result.complete is True
+    assert result.codes == ()
+    assert result.live_set_matches is True
+    assert result.journaled is True
+    assert result.status == "SUCCESS"
+    assert result.counts.accepted_documents == 1
+    assert result.counts.visible_chunks >= 1
+    assert exit_code_for(result) == 0
+    # The verdict is a closed vocabulary, not a sentence to be parsed.
+    assert result.outcome in INDEX_SERVICE_OUTCOMES
+
+
+def test_t90_a_mixed_batch_is_partial_and_never_reads_as_complete(tmp_path: Path):
+    result = t90_run(
+        t90_workspace_root(tmp_path),
+        sources=(t90_source(T90_DOCUMENT), t90_source(T90_UNUSABLE, text="   ")),
+        parent_view=t90_parent_view(T90_DOCUMENT, T90_UNUSABLE),
+    )
+
+    assert result.outcome == "PARTIAL"
+    assert result.complete is False, "a partial run is never a complete one (C-29)"
+    assert result.status == "PARTIAL"
+    assert [entry.document_id for entry in result.rejected_documents] == [T90_UNUSABLE]
+    assert [entry.code for entry in result.rejected_documents] == [UNUSABLE_TEXT_CODE]
+    assert result.counts.rejected_documents == 1
+    assert exit_code_for(result) == INDEX_SERVICE_EXIT_CODES["PARTIAL"]
+
+
+def test_t90_an_unconstructible_request_never_becomes_a_success(tmp_path: Path):
+    """A bad commit is caught at construction -- and still typed, never a traceback."""
+
+    with pytest.raises(IndexServiceValidationError):
+        t90_request(Path("."), producer_commit="not-a-commit")
+
+    # And the *runnable* half of the same claim: a request the model accepts but
+    # the service refuses is reported, not raised.
+    root = t90_workspace_root(tmp_path)
+    result = index_workspace(
+        t90_request(root, embedder_dimension=T90_DIMENSION),
+        backend=T90Store(),
+        reader=T90Store(),
+        embedder=None,  # type: ignore[arg-type]
+        workspace_root=root,
+    )
+    # A typed refusal, not an operational failure: nothing was attempted, so
+    # ``FAILED`` (which means a step began and could not finish) would overstate it.
+    assert result.outcome == "REFUSED"
+    assert result.codes == ("VALIDATION_ERROR",)
+    assert result.counts == Counts(accepted_documents=0, rejected_documents=0, visible_chunks=0)
+    assert result.sidecar_path is None
+    assert result.live_set_matches is False
+    assert result.journaled is True, "a refusal is still recorded -- it is 6.6's second action"
+
+
+def test_t90_the_four_outcomes_map_to_four_distinct_stable_exit_codes():
+    codes = {outcome: INDEX_SERVICE_EXIT_CODES[outcome] for outcome in INDEX_SERVICE_OUTCOMES}
+    assert len(set(codes.values())) == len(codes), "an exit status must not be shared by two outcomes"
+    assert codes == {"SUCCESS": 0, "PARTIAL": 3, "REFUSED": 2, "FAILED": 4}
+    assert 1 not in codes.values(), "1 stays free for a CLI usage error, never a service outcome"
+
+
+def test_t90_every_reported_code_is_a_frozen_contract_code(tmp_path: Path):
+    healthy = t90_run(t90_workspace_root(tmp_path, "a"))
+    unjournaled = t90_run(t90_workspace_root(tmp_path, "b"), journal_path=None)
+
+    for result in (healthy, unjournaled):
+        for code in result.codes:
+            assert code in MANIFEST_CODE_VOCABULARY | REPLACEMENT_CODES
+        for code in result.verification_codes:
+            assert code in BACKEND_VERIFICATION_CODES
+
+
+# -- E3-011 / C-33: the journal path is stated, never found ------------------
+
+
+def test_t90_neg_025_no_journal_path_is_refused_before_anything_is_written(tmp_path: Path):
+    root = t90_workspace_root(tmp_path)
+    # The workspace has audit/ and a project.json: if the service walked parents or
+    # read the CWD it would find a perfectly good ledger here. It must not.
+    (root / "project.json").write_text(json.dumps({"title": "a title"}), encoding="utf-8")
+    (root / "audit" / "journal.jsonl").write_text("", encoding="utf-8")
+
+    result = t90_run(root, journal_path=None)
+
+    assert result.outcome == "FAILED"
+    assert JOURNAL_DEPENDENCY_CODE in result.codes
+    assert result.journaled is False
+    assert result.complete is False
+    assert result.sidecar_path is None, "a run that cannot record itself publishes nothing"
+    assert t90_events(root) == [], "the discovered ledger was left untouched, byte for byte"
+
+
+def test_t90_neg_025_no_ledger_in_any_parent_directory_is_ever_found(tmp_path: Path):
+    root = t90_workspace_root(tmp_path)
+    (root / "phase4" / "deep").mkdir(parents=True)
+    (root / "phase4" / "project.json").write_text("{}", encoding="utf-8")
+    parent_journal = root / "audit" / "journal.jsonl"
+    parent_journal.write_text("", encoding="utf-8")
+
+    result = t90_run(root, journal_path=None)
+
+    assert result.outcome == "FAILED"
+    assert JOURNAL_DEPENDENCY_CODE in result.codes
+    assert parent_journal.read_text(encoding="utf-8") == ""
+
+
+def test_t90_the_working_directory_is_never_consulted_for_a_journal_path(tmp_path: Path, monkeypatch):
+    """Even with a ledger under the CWD, an unstated path stays a refusal."""
+
+    elsewhere = tmp_path / "elsewhere"
+    (elsewhere / "audit").mkdir(parents=True)
+    (elsewhere / "audit" / "journal.jsonl").write_text("", encoding="utf-8")
+    monkeypatch.chdir(elsewhere)
+    root = t90_workspace_root(tmp_path)
+
+    result = t90_run(root, journal_path=None)
+
+    assert result.outcome == "FAILED"
+    assert JOURNAL_DEPENDENCY_CODE in result.codes
+    assert (elsewhere / "audit" / "journal.jsonl").read_text(encoding="utf-8") == ""
+
+
+def test_t90_neg_025_an_unwritable_journal_destination_is_a_typed_failure(tmp_path: Path):
+    root = t90_workspace_root(tmp_path)
+    # A directory where the event file should go: the write cannot succeed, and it
+    # must not be swallowed.  It sits at *this kit's* destination -- pointing at the
+    # adapter's canonical ledger would be refused earlier, for a different reason
+    # (G-9), and would not exercise the failed-write path at all.
+    t90_journal_path(root).mkdir(parents=True)
+
+    result = t90_run(root)
+
+    assert result.outcome == "FAILED"
+    assert JOURNAL_DEPENDENCY_CODE in result.codes
+    assert result.journaled is False, "a failed write is never reported as appended (E3-NEG-025)"
+    assert result.complete is False
+    assert exit_code_for(result) == INDEX_SERVICE_EXIT_CODES["FAILED"]
+
+
+def test_t90_a_failed_journal_write_leaves_the_commit_intent_in_place(tmp_path: Path):
+    root = t90_workspace_root(tmp_path)
+    t90_journal_path(root).mkdir(parents=True)
+
+    result = t90_run(root)
+
+    assert list(root.glob("rag/index/*/commit-intent.json")), (
+        "T-60's 7.3 intent is removed only on confirmed publication, and a journal failure means "
+        "publication was never confirmed"
+    )
+    assert result.journaled is False
+    assert JOURNAL_DEPENDENCY_CODE in result.codes
+
+
+def test_t90_a_journal_failure_reports_no_sidecar_claim(tmp_path: Path):
+    root = t90_workspace_root(tmp_path)
+    t90_journal_path(root).mkdir(parents=True)
+
+    result = t90_run(root)
+
+    assert result.sidecar_path is None, "nothing claims an index was published when its event never landed"
+    assert result.intent_path is None
+    assert result.live_set_matches is False
+
+
+def test_t90_neg_025_the_journal_write_is_never_suppressed_by_a_broad_except():
+    """The append has one failure path, and it is typed -- not ``pass``."""
+
+    code = ast.parse(inspect.getsource(index_service.append_run_event))
+    handlers = [node for node in ast.walk(code) if isinstance(node, ast.ExceptHandler)]
+    assert handlers, "the append must handle a write failure in order to type it"
+    for handler in handlers:
+        kind = ast.dump(handler.type) if handler.type is not None else "bare-except"
+        assert "OSError" in kind, f"only an I/O failure is a journal dependency failure, found {kind}"
+        assert any(isinstance(statement, ast.Raise) for statement in handler.body), (
+            "the handler must raise; a handler that only passes would suppress the write error"
+        )
+    assert "contextlib.suppress" not in inspect.getsource(index_service)
+
+
+# -- E3-NEG-040 / -041 / C-24: one function, one envelope ------------------
+
+
+def t90_cli_workspace(tmp_path: Path, documents: tuple[str, ...] = (T90_DOCUMENT,)) -> tuple[Path, Path]:
+    """A workspace on disk the CLI can read: extracted text plus a parent view file."""
+
+    root = tmp_path / "cli-ws"
+    (root / "audit").mkdir(parents=True)
+    (root / "extracted").mkdir()
+    # This kit's own event destination directory (G-9).  ``audit/`` exists too and
+    # must stay empty: it is the adapter's ledger, which this kit never writes.
+    (root / "run-reports").mkdir()
+    records = []
+    for document_id in documents:
+        body = T90_TEXT if document_id != T90_UNUSABLE else "   "
+        (root / f"extracted/{document_id}.md").write_text(body, encoding="utf-8")
+        records.append(
+            {
+                "document_id": document_id,
+                "study_id": T90_STUDY,
+                "extracted_path": f"extracted/{document_id}.md",
+                "extracted_content_sha256": t90_fingerprint(body),
+                "extraction_method": "DETERMINISTIC_RULE",
+            }
+        )
+    view = dict(T90_PARENT_VIEW)
+    view["documents"] = records
+    view_path = root / "parent-view.json"
+    view_path.write_text(json.dumps(view), encoding="utf-8")
+    return root, view_path
+
+
+def t90_cli_args(root: Path, view_path: Path, db_name: str = "chroma", output: str = "json") -> list[str]:
+    return [
+        "index",
+        str(root),
+        "--parent-view",
+        str(view_path),
+        # This kit's own destination (G-9), never the adapter's canonical ledger.
+        "--journal",
+        str(t90_journal_path(root)),
+        "--workspace-root",
+        str(root),
+        "--run-id",
+        T90_RUN,
+        "--created-at",
+        T90_CREATED_AT,
+        "--producer-version",
+        "0.2.0",
+        "--producer-commit",
+        T90_COMMIT,
+        "--db-path",
+        str(root / db_name),
+        "--collection",
+        T90_COLLECTION,
+        "--hnsw-space",
+        T90_SPACE,
+        "--embedder",
+        "mock",
+        "--embedder-provider",
+        "test-provider",
+        "--embedder-model",
+        "test-embedder-v1",
+        "--embedder-dimension",
+        str(T90_DIMENSION),
+        "--embedder-distance-metric",
+        T90_SPACE,
+        "--format",
+        output,
+    ]
+
+
+@pytest.fixture()
+def offline_embedder(monkeypatch):
+    """A deterministic provider, so the CLI tests need no model download."""
+
+    monkeypatch.setattr(cli, "get_embedder", lambda provider=None, model_name=None, **kwargs: t90_embedder)
+
+
+def test_t90_neg_040_the_cli_delegates_to_the_one_shared_service_function(tmp_path: Path, monkeypatch):
+    """Give the CLI its own indexing path and this fails.
+
+    The CLI is a *surface*: it assembles a request and prints the result it is
+    handed. If it grew its own, the two surfaces could answer the same request
+    differently -- which is exactly what E3-NEG-040 forbids.
+    """
+
+    seen: list[IndexServiceRequest] = []
+
+    def spy(request, **kwargs):
+        seen.append(request)
+        return IndexServiceResult(
+            run_id=request.run_id,
+            outcome="REFUSED",
+            complete=False,
+            counts=Counts(accepted_documents=0, rejected_documents=0, visible_chunks=0),
+            codes=("VALIDATION_ERROR",),
+        )
+
+    monkeypatch.setattr(cli, "index_workspace", spy)
+    root, view_path = t90_cli_workspace(tmp_path)
+
+    outcome = CliRunner().invoke(app, t90_cli_args(root, view_path))
+
+    assert outcome.exit_code == INDEX_SERVICE_EXIT_CODES["REFUSED"]
+    assert len(seen) == 1, "the CLI must delegate rather than index by itself"
+    assert isinstance(seen[0], IndexServiceRequest)
+    # The CLI hands the service a *workspace-relative* reference for both
+    # destinations, because that is the form containment is decided in.
+    assert seen[0].journal_path == T90_KIT_JOURNAL
+    # This CLI invocation names the workspace root itself as its documents
+    # directory, so the relative reference is "." -- the root, spelled the one way it
+    # can be spelled relative to itself.
+    assert seen[0].docs_path == "."
+    assert t90_events(root) == [], "the CLI itself wrote nothing; the service owns the one append"
+
+
+def test_t90_the_cli_refuses_a_run_with_no_journal_option(tmp_path: Path):
+    """The journal path is a required option, not a defaulted one."""
+
+    args = t90_cli_args(*t90_cli_workspace(tmp_path))
+    trimmed = [
+        token for index, token in enumerate(args) if token != "--journal" and index != args.index("--journal") + 1
+    ]
+
+    outcome = CliRunner().invoke(app, trimmed)
+
+    assert outcome.exit_code != 0
+    assert "--journal" in outcome.output
+
+
+def test_t90_neg_041_the_api_and_the_cli_agree_on_a_success(tmp_path: Path, offline_embedder):
+    root, view_path = t90_cli_workspace(tmp_path)
+
+    cli_result = CliRunner().invoke(app, t90_cli_args(root, view_path))
+
+    assert cli_result.exit_code == 0
+    envelope = json.loads(cli_result.output)
+    assert envelope["outcome"] == "SUCCESS"
+    assert envelope["complete"] is True
+    # The same request through the Python function: same typed status, same
+    # envelope, field for field.
+    store = T90Store()
+    api_result = index_workspace(
+        t90_request(root),
+        backend=store,
+        reader=store,
+        embedder=t90_embedder,
+        workspace_root=root,
+    )
+    assert api_result.outcome == envelope["outcome"]
+    assert api_result.complete == envelope["complete"]
+    assert api_result.counts.model_dump() == envelope["counts"]
+    assert api_result.manifest_id == envelope["manifest_id"]
+    assert api_result.sidecar_path == envelope["sidecar_path"]
+    assert api_result.journaled == envelope["journaled"]
+    assert api_result.envelope() == envelope
+
+
+def test_t90_neg_041_the_api_and_the_cli_agree_on_a_refusal(tmp_path: Path, offline_embedder):
+    # One malformed parent view, offered to both surfaces. The API caller sees the
+    # typed refusal raised at request construction; the CLI turns it into the same
+    # refusal as a typed outcome and a refused exit status. Different *delivery*,
+    # identical *verdict* -- and neither one invents a success string.
+    view_without_documents = dict(T90_PARENT_VIEW)
+    root, view_path = t90_cli_workspace(tmp_path)
+    view_path.write_text(json.dumps(view_without_documents), encoding="utf-8")
+
+    cli_result = CliRunner().invoke(app, t90_cli_args(root, view_path))
+
+    assert cli_result.exit_code == INDEX_SERVICE_EXIT_CODES["REFUSED"]
+    envelope = json.loads(cli_result.output)
+    assert envelope["outcome"] == "REFUSED"
+    assert envelope["complete"] is False
+    assert envelope["sidecar_path"] is None
+    assert envelope["live_set_matches"] is False
+    assert envelope["counts"] == {"accepted_documents": 0, "rejected_documents": 0, "visible_chunks": 0}
+
+    with pytest.raises(IndexServiceValidationError) as raised:
+        t90_request(t90_workspace_root(tmp_path, "api-refused"), parent_view=view_without_documents)
+    assert raised.value.code == tuple(envelope["codes"])[0], (
+        "both surfaces must name the same frozen code for the same malformed parent view"
+    )
+
+
+def test_t90_neg_041_the_api_and_the_cli_agree_on_a_journal_failure(tmp_path: Path, offline_embedder):
+    root, view_path = t90_cli_workspace(tmp_path)
+    t90_journal_path(root).mkdir(parents=True)  # unwritable destination
+
+    cli_result = CliRunner().invoke(app, t90_cli_args(root, view_path))
+
+    assert cli_result.exit_code == INDEX_SERVICE_EXIT_CODES["FAILED"]
+    envelope = json.loads(cli_result.output)
+    assert envelope["outcome"] == "FAILED"
+    assert JOURNAL_DEPENDENCY_CODE in envelope["codes"]
+    assert envelope["journaled"] is False
+    assert envelope["complete"] is False
+
+    other = t90_workspace_root(tmp_path, "api-failed")
+    (other / f"extracted/{T90_DOCUMENT}.md").write_text(T90_TEXT, encoding="utf-8")
+    t90_journal_path(other).mkdir(parents=True)
+    store = T90Store()
+    api_result = index_workspace(
+        t90_request(other),
+        backend=store,
+        reader=store,
+        embedder=t90_embedder,
+        workspace_root=other,
+    )
+    assert api_result.outcome == envelope["outcome"]
+    assert JOURNAL_DEPENDENCY_CODE in api_result.codes
+    assert api_result.journaled is envelope["journaled"]
+
+
+def test_t90_the_output_format_may_not_change_the_status(tmp_path: Path, offline_embedder):
+    """Human formatting is formatting; the verdict and the exit status are not."""
+
+    root, view_path = t90_cli_workspace(tmp_path)
+    as_json = CliRunner().invoke(app, t90_cli_args(root, view_path, db_name="chroma-a"))
+    # The human run names the same facts; the store is a second one so the two runs
+    # are genuinely separate rather than a replay.
+    human_args = [token for token in t90_cli_args(root, view_path, db_name="chroma-b") if token != "json"]
+    as_human = CliRunner().invoke(app, human_args[:-1])
+
+    assert as_json.exit_code == as_human.exit_code
+    envelope = json.loads(as_json.output)
+    plain = re.sub(r"\x1b\[[0-9;]*m", "", as_human.output)
+    assert envelope["outcome"] in plain
+    assert f"{envelope['counts']['accepted_documents']} accepted" in plain
+    assert f"{envelope['counts']['visible_chunks']} chunks" in plain
+
+
+def test_t90_the_cli_reports_an_unreadable_parent_view_as_a_refusal_not_a_traceback(tmp_path: Path):
+    root, view_path = t90_cli_workspace(tmp_path)
+    view_path.write_text("{not json", encoding="utf-8")
+
+    outcome = CliRunner().invoke(app, t90_cli_args(root, view_path))
+
+    assert outcome.exit_code == INDEX_SERVICE_EXIT_CODES["REFUSED"]
+    assert "Traceback" not in outcome.output
+    assert json.loads(outcome.output)["outcome"] == "REFUSED"
+
+
+def test_t90_the_cli_refuses_a_parent_record_whose_file_is_absent(tmp_path: Path, offline_embedder):
+    root, view_path = t90_cli_workspace(tmp_path)
+    (root / f"extracted/{T90_DOCUMENT}.md").unlink()
+
+    outcome = CliRunner().invoke(app, t90_cli_args(root, view_path))
+
+    assert outcome.exit_code == INDEX_SERVICE_EXIT_CODES["REFUSED"]
+    envelope = json.loads(outcome.output)
+    assert envelope["sidecar_path"] is None
+    assert envelope["counts"]["accepted_documents"] == 0
+
+
+def test_t90_the_cli_refuses_an_absolute_extracted_reference(tmp_path: Path, offline_embedder):
+    root, view_path = t90_cli_workspace(tmp_path)
+    view = json.loads(view_path.read_text(encoding="utf-8"))
+    view["documents"][0]["extracted_path"] = "C:/elsewhere/x.md"
+    view_path.write_text(json.dumps(view), encoding="utf-8")
+
+    outcome = CliRunner().invoke(app, t90_cli_args(root, view_path))
+
+    assert outcome.exit_code == INDEX_SERVICE_EXIT_CODES["REFUSED"]
+    assert "Traceback" not in outcome.output
+
+
+# -- the run report: a kit-owned event, never the acceptance event -----------
+
+
+def test_t90_the_run_report_is_written_to_the_stated_path_and_nowhere_else(tmp_path: Path):
+    root = t90_workspace_root(tmp_path)
+    result = t90_run(root)
+
+    events = t90_events(root)
+    assert len(events) == 1, "exactly one event per run, appended to the stated path"
+    assert events[0]["event_type"] == RUN_REPORT_EVENT_TYPE
+    assert events[0]["action"] == ACTION_RUN_BUILT
+    assert events[0]["run_id"] == result.run_id
+    # ``audit/`` is present in the fixture and is still empty after a healthy run:
+    # the adapter's ledger is not this kit's to write (G-9), and the run's own
+    # event landed in ``run-reports/`` instead.
+    assert sorted(path.name for path in root.iterdir()) == ["audit", "extracted", "rag", "run-reports"]
+    assert list((root / "audit").iterdir()) == [], "the adapter's canonical ledger is never written by this kit"
+
+
+def test_t90_a_parent_view_missing_a_limb_is_typed_not_a_traceback(tmp_path: Path):
+    """Every parent-view limb the CLI binds must be refused by name, not raise a KeyError.
+
+    The CLI assembles the request from the caller's parent view, so a malformed one
+    arrives as an adapter bug rather than a service verdict.  A bare ``KeyError``
+    would be exactly the free-text failure mode this command was rewritten to
+    remove, and it would exit 1 -- an exit code the contract does not contain.
+    """
+
+    root, view_path = t90_cli_workspace(tmp_path)
+    view = json.loads(view_path.read_text(encoding="utf-8"))
+    for limb in ("workspace_id", "artifact_id", "sha256"):
+        broken = dict(view)
+        del broken[limb]
+        broken_path = view_path.with_name(f"parent_{limb}.json")
+        broken_path.write_text(json.dumps(broken), encoding="utf-8")
+
+        # The machine surface: a typed refusal and nothing else.
+        as_json = CliRunner().invoke(app, t90_cli_args(root, broken_path))
+        assert as_json.exit_code == INDEX_SERVICE_EXIT_CODES["REFUSED"], f"{limb} must refuse, not crash"
+        assert "Traceback" not in as_json.output
+        assert json.loads(as_json.output)["outcome"] == "REFUSED"
+
+        # The human surface: the same refusal, naming the limb that is missing.
+        as_human = CliRunner().invoke(
+            app, [token for token in t90_cli_args(root, broken_path, output="human") if token != "human"][:-1]
+        )
+        plain = _t90_plain(as_human.output)
+        assert limb in plain, f"the refusal must name the missing limb {limb!r}"
+        assert "KeyError" not in plain
+
+
+def _t90_plain(output: str) -> str:
+    """Console output without the colour codes rich emits per-word on Windows."""
+
+    return re.sub(r"\x1b\[[0-9;]*m", "", output)
+
+
+#: A parent-record limb the CLI binds for every document, and the ways it can be
+#: wrong.  Each entry is (mutate, description); the mutation is applied to a copy
+#: of one well-formed record.
+T90_RECORD_LIMB_CASES = [
+    (lambda record: record.pop("study_id"), "missing study_id"),
+    (lambda record: record.pop("extracted_path"), "missing extracted_path"),
+    (lambda record: record.pop("extracted_content_sha256"), "missing extracted_content_sha256"),
+    (lambda record: record.pop("document_id"), "missing document_id"),
+    (lambda record: record.update(study_id="   "), "blank study_id"),
+    (lambda record: record.update(extracted_path="   "), "blank extracted_path"),
+    (lambda record: record.update(study_id=17), "wrong-typed study_id"),
+    (lambda record: record.update(extracted_path=["a", "b"]), "wrong-typed extracted_path"),
+]
+
+
+@pytest.mark.parametrize("mutate,description", T90_RECORD_LIMB_CASES, ids=[case[1] for case in T90_RECORD_LIMB_CASES])
+def test_t90_a_malformed_parent_record_is_refused_not_failed(tmp_path: Path, mutate, description):
+    """A malformed *record* limb is a refusal, on both surfaces, with exit 2.
+
+    The parent-view guard distinguishes a refusal (the caller stated something
+    malformed) from a failure (the run began and could not finish).  Without this
+    family the distinction is unpinned: deleting the record guard silently
+    downgrades every one of these cases to ``FAILED``/``DEPENDENCY_ERROR``/exit 4
+    with the suite still green, because a KeyError is simply absorbed by the
+    service's own defensive handler -- honestly, but with the wrong verdict.
+    """
+
+    root, view_path = t90_cli_workspace(tmp_path)
+    view = json.loads(view_path.read_text(encoding="utf-8"))
+    record = dict(view["documents"][0])
+    mutate(record)
+    view["documents"] = [record]
+    broken_path = view_path.with_name(f"parent_record_{description.replace(' ', '_')}.json")
+    broken_path.write_text(json.dumps(view), encoding="utf-8")
+
+    # Surface 1: the CLI, as a typed envelope and a contract exit code.
+    as_json = CliRunner().invoke(app, t90_cli_args(root, broken_path))
+    assert as_json.exit_code == INDEX_SERVICE_EXIT_CODES["REFUSED"], f"{description} must refuse, not crash"
+    assert "Traceback" not in as_json.output
+    envelope = json.loads(as_json.output)
+    assert envelope["outcome"] == "REFUSED"
+    assert envelope["codes"] == ["VALIDATION_ERROR"]
+    assert envelope["complete"] is False
+    assert envelope["sidecar_path"] is None
+    assert envelope["counts"] == {"accepted_documents": 0, "rejected_documents": 0, "visible_chunks": 0}
+
+    # Surface 2: the same malformed record offered to the Python API.  The API
+    # refuses it with the same frozen code; whether that arrives as a raised typed
+    # error (at request construction) or as a returned typed result depends only on
+    # which check catches it first, and both are the same verdict.
+    store = T90Store()
+    try:
+        request = t90_request(root, parent_view=view)
+    except IndexServiceValidationError as exc:
+        api_code = exc.code
+        assert api_code == "VALIDATION_ERROR"
+        assert envelope["codes"] == [api_code], "both surfaces must name the same frozen code"
+        return
+    api_result = index_workspace(
+        request,
+        backend=store,
+        reader=store,
+        embedder=t90_embedder,
+        workspace_root=root,
+    )
+    assert api_result.outcome == "REFUSED", f"{description} must refuse on the API too"
+    assert api_result.codes == ("VALIDATION_ERROR",)
+    assert api_result.outcome == envelope["outcome"], "the two surfaces must agree on the verdict"
+
+
+def _t90_broken_store_args(root: Path, view_path: Path, *, extra: list[str]) -> list[str]:
+    """``t90_cli_args`` with a store the CLI cannot open."""
+
+    return [*t90_cli_args(root, view_path), *extra]
+
+
+@pytest.mark.parametrize(
+    "extra,expected_outcome,expected_code,description",
+    [
+        (
+            ["--db-path", "AS_FILE"],
+            "REFUSED",
+            "VALIDATION_ERROR",
+            "--db-path names a file, not a store directory",
+        ),
+        (
+            ["--collection", "c", "--db-path", "FRESH"],
+            "REFUSED",
+            "VALIDATION_ERROR",
+            "--collection shorter than chroma allows",
+        ),
+        (
+            ["--db-path", "CORRUPT_STORE"],
+            "FAILED",
+            "DEPENDENCY_ERROR",
+            "--db-path holds a store whose database will not open",
+        ),
+    ],
+    ids=["db-path-is-a-file", "collection-too-short", "db-path-is-a-corrupt-store"],
+)
+def test_t90_a_store_the_cli_cannot_open_is_typed_not_a_crash(
+    tmp_path: Path, extra, expected_outcome, expected_code, description
+):
+    """Opening a caller-named store happens in the CLI frame, before the service runs.
+
+    ``index_workspace`` cannot see a failure raised while its arguments are being
+    built, so an unhandled one escapes as a traceback and a non-contract exit 1.
+    Every reproduced input must answer with a typed envelope and a contract status.
+
+    The mapping is pinned per case, not merely checked to be *some* contract
+    outcome, because the two failure classes are not interchangeable: a store whose
+    *shape* or *name* the caller stated is a refusal (the caller can fix it), while
+    a store that will not open on a well-formed request is an operational failure
+    of a declared dependency (the caller cannot).  Collapsing either into the other
+    is the defect this case exists to catch, so each expected pair is exact.
+    """
+
+    root, view_path = t90_cli_workspace(tmp_path)
+    as_file = root / "db-is-a-file"
+    as_file.write_text("this is a file, not a store", encoding="utf-8")
+    corrupt = root / "corrupt-store"
+    corrupt.mkdir()
+    (corrupt / "chroma.sqlite3").write_bytes(b"this is not a sqlite database, and never was, " * 32)
+    resolved = [
+        token.replace("AS_FILE", str(as_file))
+        .replace("FRESH", str(root / "fresh-store"))
+        .replace("CORRUPT_STORE", str(corrupt))
+        for token in extra
+    ]
+
+    as_json = CliRunner().invoke(app, _t90_broken_store_args(root, view_path, extra=resolved))
+
+    assert as_json.exit_code == INDEX_SERVICE_EXIT_CODES[expected_outcome], (
+        f"{description} must exit {expected_outcome}, never another status"
+    )
+    assert as_json.exit_code != 1, f"{description} escaped as a bare traceback exit"
+    assert "Traceback" not in as_json.output
+    envelope = json.loads(as_json.output)
+    assert envelope["outcome"] == expected_outcome, f"{description} was classified as the wrong outcome"
+    assert envelope["codes"] == [expected_code], f"{description} carried the wrong frozen code"
+    assert envelope["complete"] is False
+    assert envelope["counts"] == {"accepted_documents": 0, "rejected_documents": 0, "visible_chunks": 0}
+    assert envelope["journaled"] is False, "a run that never began journaled nothing"
+
+    # The same input on the human surface: same status, no traceback, and the
+    # typed outcome and code are still named rather than swallowed.  Built from
+    # the human-output arg builder so this is genuinely the human surface, not a
+    # second JSON run (``t90_cli_args`` appends ``--format <output>`` last).
+    as_human = CliRunner().invoke(app, [*t90_cli_args(root, view_path, output="human"), *resolved])
+    assert as_human.exit_code == as_json.exit_code
+    plain = _t90_plain(as_human.output)
+    assert "Traceback" not in plain
+    assert envelope["outcome"] in plain, "the human line must name the typed outcome"
+    assert f"codes: {', '.join(envelope['codes'])}" in plain, "the human line must name the typed code"
+
+
+def test_t90_store_open_result_separates_a_caller_shape_from_an_environment_fault(tmp_path: Path):
+    """The store-open verdict is the caller/environment line, and only that line.
+
+    Pinned at the boundary rather than only through the CLI, because the CLI is
+    where the first version got it wrong: a blanket catch reported a corrupt store
+    as a malformed request.  The classifier is the one place that decides, so it is
+    tested directly with signal exceptions -- no chroma import, so this pins the
+    *rule* (path shape and name shape are the caller's; everything else is the
+    environment's) rather than one backend's exception names.
+
+    Note the deliberate boundary: the three path-shape errors are exactly the
+    packet's list, so ``FileNotFoundError`` -- which a ``--db-path`` under an
+    existing file also raises -- is operational here, not a refusal.
+    """
+
+    root, _view_path = t90_cli_workspace(tmp_path)
+    request = t90_request(root)
+    db_path, collection = str(root / "store"), T90_COLLECTION
+
+    caller_shape = (
+        FileExistsError("--db-path already names a file"),
+        NotADirectoryError("--db-path is under a file"),
+        IsADirectoryError("--db-path is a directory where a file was expected"),
+        type("InvalidArgumentError", (Exception,), {})("that collection name is not usable"),
+    )
+    for exc in caller_shape:
+        result = store_open_result(request, exc, db_path=db_path, collection=collection)
+        assert result.outcome == "REFUSED", f"{type(exc).__name__} is the caller's to fix"
+        assert result.codes == ("VALIDATION_ERROR",)
+        assert result.complete is False
+        assert result.journaled is False
+
+    environment = (
+        type("InternalError", (Exception,), {})("error returned from database"),
+        PermissionError("the process may not write here"),
+        OSError("the store volume went away"),
+        FileNotFoundError("--db-path is under an existing file"),
+        KeyError("an unexpected store defect"),
+    )
+    for exc in environment:
+        result = store_open_result(request, exc, db_path=db_path, collection=collection)
+        assert result.outcome == "FAILED", f"{type(exc).__name__} is not the caller's to fix"
+        assert result.codes == ("DEPENDENCY_ERROR",), "an unmet dependency is a DEPENDENCY_ERROR"
+        assert result.complete is False
+        assert result.journaled is False, "a run that never began journaled nothing"
+
+    # The two verdicts are distinct, and neither is ever a success.
+    shape = store_open_result(request, FileExistsError("x"), db_path=db_path, collection=collection)
+    fault = store_open_result(request, OSError("x"), db_path=db_path, collection=collection)
+    assert shape.outcome != fault.outcome
+    assert exit_code_for(shape) == 2 and exit_code_for(fault) == 4
+    for result in (shape, fault):
+        assert result.outcome not in {"SUCCESS", "PARTIAL"}
+
+
+def test_t90_the_run_report_is_not_the_6_6_acceptance_event(tmp_path: Path):
+    """A kit run report may never be mistaken for the adapter's acceptance event."""
+
+    root = t90_workspace_root(tmp_path)
+    t90_run(root)
+    action = t90_events(root)[0]["action"]
+
+    assert action in RUN_REPORT_ACTIONS
+    for acceptance_action in ("RAG_INDEX_BUILT", "RAG_INDEX_REJECTED", "RAG_DOCUMENT_ACCEPTED"):
+        assert action != acceptance_action, "these belong to the harness acceptance adapter (check 7, T-130)"
+
+
+def test_t90_the_run_report_body_is_self_sealed(tmp_path: Path):
+    root = t90_workspace_root(tmp_path)
+    t90_run(root)
+    event = t90_events(root)[0]
+
+    assert event["artifact_checksum"] is not None
+    unsealed = dict(event)
+    unsealed["artifact_checksum"] = None
+    assert stage_i_artifact_checksum(unsealed) == event["artifact_checksum"]
+
+
+def test_t90_a_tampered_run_report_does_not_verify(tmp_path: Path):
+    root = t90_workspace_root(tmp_path)
+    t90_run(root)
+    event = dict(t90_events(root)[0])
+    event["run_id"] = "RUN-" + "f" * 32
+
+    unsealed = dict(event)
+    unsealed["artifact_checksum"] = None
+    assert stage_i_artifact_checksum(unsealed) != event["artifact_checksum"]
+
+
+def test_t90_two_identical_runs_report_the_same_event_id(tmp_path: Path):
+    """The event id is derived from the run identity, never from a clock."""
+
+    root = t90_workspace_root(tmp_path)
+    t90_run(root)
+    t90_run(root)
+    events = t90_events(root)
+
+    assert len(events) == 2
+    assert events[0]["event_id"] == events[1]["event_id"], (
+        "a clock-derived identity would differ between two identical runs"
+    )
+
+
+def test_t90_no_result_or_event_carries_an_absolute_path_a_secret_or_a_db_path(tmp_path: Path):
+    root = t90_workspace_root(tmp_path)
+    result = t90_run(root)
+    event = t90_events(root)[0]
+
+    flat = json.dumps(result.envelope()) + json.dumps(event)
+    assert "db_path" not in flat
+    assert str(root) not in flat, "the machine-local workspace path must not travel"
+    for leak in ("bearer", "api_key", "API_KEY", "password", "secret"):
+        assert leak not in flat
+    assert result.sidecar_path is not None
+    assert not result.sidecar_path.startswith(("/", "\\", "C:"))
+    assert event["manifest_path"] == result.sidecar_path
+
+
+def test_t90_the_run_report_names_the_refused_documents_by_code_only(tmp_path: Path):
+    root = t90_workspace_root(tmp_path)
+    t90_run(
+        root,
+        sources=(t90_source(T90_DOCUMENT), t90_source(T90_UNUSABLE, text="   ")),
+        parent_view=t90_parent_view(T90_DOCUMENT, T90_UNUSABLE),
+    )
+    event = t90_events(root)[0]
+
+    assert event["action"] == ACTION_RUN_REJECTED
+    assert event["rejected_documents"] == [{"code": UNUSABLE_TEXT_CODE, "document_id": T90_UNUSABLE}]
+
+
+def test_t90_the_run_report_carries_the_deterministic_fingerprints(tmp_path: Path):
+    root = t90_workspace_root(tmp_path)
+    result = t90_run(root)
+    event = t90_events(root)[0]
+
+    for field in (
+        "chunk_set_fingerprint",
+        "configuration_fingerprint",
+        "corpus_fingerprint",
+        "index_fingerprint",
+        "production_fingerprint",
+        "protocol_fingerprint",
+    ):
+        assert event[field] is not None, f"the run report must carry {field} so it can be verified"
+    assert event["manifest_id"] == result.manifest_id
+    assert event["parent_artifact_sha256"] == T90_PARENT_SHA
+    assert event["workspace_id"] == T90_WORKSPACE
+
+
+# -- result honesty: the battery that makes a lie unconstructible -----------
+
+
+def test_t90_a_result_that_would_leak_a_path_is_refused_at_construction():
+    with pytest.raises(IndexServiceValidationError):
+        IndexServiceResult(
+            run_id=T90_RUN,
+            outcome="REFUSED",
+            complete=False,
+            counts=Counts(accepted_documents=0, rejected_documents=0, visible_chunks=0),
+            codes=("VALIDATION_ERROR",),
+            sidecar_path="rag/index/../../etc/passwd",
+        )
+
+
+def test_t90_a_result_claiming_success_without_its_event_is_refused():
+    """A complete index whose event was never appended is unconstructible."""
+
+    with pytest.raises(IndexServiceValidationError):
+        IndexServiceResult(
+            run_id=T90_RUN,
+            outcome="SUCCESS",
+            complete=True,
+            status="SUCCESS",
+            counts=Counts(accepted_documents=1, rejected_documents=0, visible_chunks=2),
+            live_set_matches=True,
+            sidecar_path="rag/index/run/IDX-x.json",
+            journaled=False,
+        )
+
+
+def test_t90_a_result_reporting_a_dependency_error_may_not_claim_it_journaled():
+    with pytest.raises(IndexServiceValidationError):
+        IndexServiceResult(
+            run_id=T90_RUN,
+            outcome="FAILED",
+            complete=False,
+            counts=Counts(accepted_documents=0, rejected_documents=0, visible_chunks=0),
+            codes=(JOURNAL_DEPENDENCY_CODE,),
+            journaled=True,
+        )
+
+
+def test_t90_a_partial_result_without_a_named_refusal_is_refused():
+    with pytest.raises(IndexServiceValidationError):
+        IndexServiceResult(
+            run_id=T90_RUN,
+            outcome="PARTIAL",
+            complete=False,
+            status="PARTIAL",
+            counts=Counts(accepted_documents=1, rejected_documents=1, visible_chunks=2),
+            live_set_matches=True,
+            sidecar_path="rag/index/run/IDX-x.json",
+            journaled=True,
+        )
+
+
+def test_t90_a_success_whose_live_set_was_never_verified_is_refused():
+    with pytest.raises(IndexServiceValidationError):
+        IndexServiceResult(
+            run_id=T90_RUN,
+            outcome="SUCCESS",
+            complete=True,
+            status="SUCCESS",
+            counts=Counts(accepted_documents=1, rejected_documents=0, visible_chunks=2),
+            live_set_matches=False,
+            sidecar_path="rag/index/run/IDX-x.json",
+            journaled=True,
+        )
+
+
+def test_t90_a_result_whose_outcome_is_a_sentence_is_refused():
+    with pytest.raises(IndexServiceValidationError):
+        IndexServiceResult(
+            run_id=T90_RUN,
+            outcome="Successfully indexed 2 files.",
+            complete=False,
+            counts=Counts(accepted_documents=0, rejected_documents=0, visible_chunks=0),
+            codes=("VALIDATION_ERROR",),
+        )
+
+
+def test_t90_no_similarity_is_ever_reported_as_verification(tmp_path: Path):
+    result = t90_run(t90_workspace_root(tmp_path))
+
+    flat = json.dumps(result.envelope()).lower()
+    for word in ("similarity", "entailment", "relevance_score", "confidence"):
+        assert word not in flat, "check 6 is a set identity, not a similarity (G-8)"
+
+
+# -- request discipline -----------------------------------------------------
+
+
+def test_t90_the_models_are_closed_frozen_and_strict():
+    for model in (IndexServiceRequest, IndexServiceResult, IndexedSource):
+        assert model.model_config.get("extra") == "forbid"
+        assert model.model_config.get("frozen") is True
+        assert model.model_config.get("strict") is True
+
+
+def test_t90_an_undeclared_request_field_is_refused_rather_than_dropped():
+    with pytest.raises(IndexServiceValidationError):
+        t90_request(Path("."), journal="audit/journal.jsonl")
+
+
+def test_t90_a_producer_commit_that_is_not_a_full_object_name_is_refused():
+    with pytest.raises(IndexServiceValidationError):
+        t90_request(Path("."), producer_commit="main")
+    with pytest.raises(IndexServiceValidationError):
+        t90_request(Path("."), producer_commit=T90_COMMIT[:12])
+
+
+def test_t90_the_run_timestamp_is_stated_not_read_from_a_clock():
+    with pytest.raises(IndexServiceValidationError):
+        t90_request(Path("."), created_at="2026-09-29")
+
+
+@pytest.mark.parametrize(
+    "perturbed,description",
+    [
+        (("artifact_id",), "only the parent artifact id disagrees"),
+        (("sha256",), "only the parent content fingerprint disagrees"),
+        (("workspace_id",), "only the parent workspace disagrees"),
+        (("artifact_id", "sha256", "workspace_id"), "every parent limb disagrees"),
+    ],
+    ids=["parent-artifact-id", "parent-sha256", "parent-workspace-id", "all-three-limbs"],
+)
+def test_t90_a_document_whose_parent_limbs_disagree_with_the_parent_view_is_refused(perturbed, description):
+    """A document is bound to the parent this run was handed, limb for limb.
+
+    Every perturbed value stays well formed -- a different ``ART-``/``WSP-`` id and
+    a different but valid ``sha256:`` fingerprint -- so the pattern checks above
+    cannot be what refuses it; only the cross-check against the parent view can.
+
+    The "every parent limb disagrees" row is what makes the assertion about
+    *disagreement* rather than about the guard firing at all.  The guard loops over
+    three limbs, so with only one perturbed the other two still agree, and a
+    comparison flipped to test for agreement would raise on one of those instead
+    and pass this test while no longer refusing the limb that actually disagreed.
+    Perturbing all three leaves no limb to agree, so only a genuine
+    "disagrees is refused" comparison can satisfy it.
+    """
+
+    view = t90_parent_view(T90_DOCUMENT)
+    broken = dict(view)
+    for name in perturbed:
+        broken[name] = {
+            "artifact_id": "ART-" + "9" * 32,
+            "sha256": "sha256:" + "9" * 64,
+            "workspace_id": "WSP-" + "9" * 32,
+        }[name]
+    with pytest.raises(IndexServiceValidationError):
+        t90_request(Path("."), parent_view=broken)
+
+
+def test_t90_a_parent_view_without_its_documents_is_refused():
+    with pytest.raises(IndexServiceValidationError):
+        t90_request(Path("."), parent_view=dict(T90_PARENT_VIEW))
+
+
+def test_t90_one_run_indexes_one_document_once():
+    with pytest.raises(IndexServiceValidationError):
+        t90_request(Path("."), sources=(t90_source(T90_DOCUMENT), t90_source(T90_DOCUMENT)))
+
+
+def test_t90_an_embedder_reporting_a_different_dimension_is_refused(tmp_path: Path):
+    root = t90_workspace_root(tmp_path)
+    store = T90Store()
+
+    # A callable object, because a plain function cannot carry the ``dimension``
+    # attribute the service reads to compare against the declared identity.
+    class WrongDimension:
+        dimension = T90_DIMENSION + 1
+
+        def __call__(self, texts: Sequence[str]) -> list[list[float]]:
+            return [[0.0] * (T90_DIMENSION + 1) for _ in texts]
+
+    result = index_workspace(
+        t90_request(root),
+        backend=store,
+        reader=store,
+        embedder=WrongDimension(),
+        workspace_root=root,
+    )
+
+    assert result.outcome == "REFUSED", (
+        "a declared identity the vectors contradict is refused before any backend call, not attempted and failed"
+    )
+    assert result.codes == ("VALIDATION_ERROR",)
+    assert result.live_set_matches is False
+    assert result.sidecar_path is None
+
+
+# -- containment: the workspace, not the process, decides where a run may write -
+
+
+def test_t90_a_relative_journal_path_is_bound_to_the_workspace_not_the_cwd(tmp_path: Path, monkeypatch):
+    """A relative destination is the same file whichever directory we invoke from."""
+
+    root = t90_workspace_root(tmp_path)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+
+    result = t90_run(root)
+
+    assert result.outcome == "SUCCESS"
+    assert t90_events(root), "the event landed under the workspace root, not under the CWD"
+    assert not (elsewhere / "run-reports").exists(), (
+        "the process's working directory is not a destination: nothing was created there"
+    )
+
+
+@pytest.mark.parametrize(
+    ("journal_path", "description"),
+    [
+        ("/etc/rag/events.jsonl", "a POSIX absolute path"),
+        ("C:/outside/rag/events.jsonl", "a drive-absolute path"),
+        ("\\\\server\\share\\events.jsonl", "a UNC path"),
+        ("run-reports/../../escape/events.jsonl", "a traversal out of the workspace"),
+        ("../escape/events.jsonl", "a leading traversal"),
+    ],
+)
+def test_t90_an_absolute_or_escaping_journal_path_is_refused(tmp_path: Path, journal_path, description):
+    """A destination that leaves the workspace is refused, whatever its spelling."""
+
+    root = t90_workspace_root(tmp_path)
+
+    result = t90_run(root, journal_path=journal_path)
+
+    assert result.outcome == "REFUSED", f"{description} must be refused"
+    assert result.codes == ("VALIDATION_ERROR",)
+    assert result.journaled is False
+    assert result.complete is False
+    assert exit_code_for(result) == INDEX_SERVICE_EXIT_CODES["REFUSED"]
+
+
+@pytest.mark.parametrize(
+    ("spelling", "description"),
+    [
+        ("ABSOLUTE", "an absolute path to this kit's own destination"),
+        ("TRAVERSAL", "a '..' path that lands back on this kit's own destination"),
+    ],
+)
+def test_t90_a_malformed_spelling_is_refused_even_when_it_would_resolve_inside(tmp_path: Path, spelling, description):
+    """The shape rules are not merely redundant with resolved containment.
+
+    Both spellings here name the *same in-workspace destination* a correct run
+    uses.  Only the lexical check can refuse them: resolved containment would pass
+    them, because resolved they land exactly where the run was going to write.  So
+    they are what proves the shape rules do real work rather than duplicating the
+    containment decision -- and, more importantly, that a request-shape refusal is
+    reported as such instead of depending on what the filesystem would have said.
+    """
+
+    root = t90_workspace_root(tmp_path)
+    in_scope = t90_journal_path(root)
+    journal_path = str(in_scope) if spelling == "ABSOLUTE" else "run-reports/../run-reports/rag-index.jsonl"
+
+    result = t90_run(root, journal_path=journal_path)
+
+    assert result.outcome == "REFUSED", f"{description} must be refused even though it resolves inside"
+    assert result.codes == ("VALIDATION_ERROR",)
+    assert result.journaled is False
+    assert not in_scope.exists(), "the refused request wrote nothing"
+
+
+def test_t90_the_canonical_audit_ledger_is_refused_as_this_kits_destination(tmp_path: Path):
+    """G-9: this kit never writes the adapter's ledger, and refuses it by construction."""
+
+    root = t90_workspace_root(tmp_path)
+    ledger = root / "audit" / "journal.jsonl"
+    ledger.write_text("", encoding="utf-8")
+
+    result = t90_run(root, journal_path="audit/journal.jsonl")
+
+    assert result.outcome == "REFUSED", "the adapter's canonical ledger is not this kit's to write"
+    assert result.codes == ("VALIDATION_ERROR",)
+    assert result.journaled is False
+    assert ledger.read_text(encoding="utf-8") == "", "the ledger was refused, not written through"
+
+
+def test_t90_the_ledger_refusal_covers_every_spelling_of_that_path(tmp_path: Path):
+    """Redundant separators and ``.`` segments do not get past the ledger check."""
+
+    root = t90_workspace_root(tmp_path)
+
+    for spelling in ("audit//journal.jsonl", "./audit/journal.jsonl", "audit/./journal.jsonl"):
+        result = t90_run(root, journal_path=spelling)
+        assert result.outcome == "REFUSED", f"{spelling!r} still names the canonical ledger"
+        assert not t90_journal_path(root).exists(), "no run wrote anywhere while the ledger check was being tested"
+
+
+def test_t90_a_ledger_shaped_journal_path_that_leaves_the_workspace_is_still_refused(tmp_path: Path):
+    """The ledger rule is about *this* workspace's ledger, not the name ``journal.jsonl``."""
+
+    root = t90_workspace_root(tmp_path)
+    outside = tmp_path / "outside"
+    (outside / "audit").mkdir(parents=True)
+
+    # ``other/audit/journal.jsonl`` is a different workspace's ledger, and reaching
+    # it is refused for the containment reason before the ledger name is considered.
+    result = t90_run(root, journal_path="../outside/audit/journal.jsonl")
+
+    assert result.outcome == "REFUSED"
+    assert result.codes == ("VALIDATION_ERROR",)
+    assert not (outside / "audit" / "journal.jsonl").exists()
+
+
+def test_t90_the_canonical_ledger_refusal_is_case_insensitive_on_windows(tmp_path: Path):
+    """The filesystem is case-insensitive here, so the rule must be too."""
+
+    root = t90_workspace_root(tmp_path)
+
+    result = t90_run(root, journal_path="AUDIT/Journal.JSONL")
+
+    assert result.outcome == "REFUSED", "AUDIT/Journal.JSONL is the same file on this platform"
+    assert result.codes == ("VALIDATION_ERROR",)
+
+
+# -- docs_path: required, contained, existing, and load-bearing --------------
+
+
+def test_t90_docs_path_is_required(tmp_path: Path):
+    """No default, no discovery: a request that omits it is not constructible."""
+
+    with pytest.raises(IndexServiceValidationError) as raised:
+        IndexServiceRequest(
+            **{
+                key: value
+                for key, value in {
+                    "run_id": T90_RUN,
+                    "created_at": T90_CREATED_AT,
+                    "sources": (t90_source(T90_DOCUMENT),),
+                    "parent_view": t90_parent_view(T90_DOCUMENT),
+                    "chunker_configuration": dict(T90_CHUNKER_CONFIG),
+                    "backend_type": "chroma",
+                    "collection_name": T90_COLLECTION,
+                    "storage_schema_version": "chroma-2",
+                    "hnsw_space": T90_SPACE,
+                    "embedder_provider": "test-provider",
+                    "embedder_model": "test-embedder-v1",
+                    "embedder_dimension": T90_DIMENSION,
+                    "embedder_normalize_embeddings": True,
+                    "embedder_distance_metric": T90_SPACE,
+                    "producer_version": "0.2.0",
+                    "producer_commit": T90_COMMIT,
+                    "journal_path": T90_KIT_JOURNAL,
+                }.items()
+            }
+        )
+    assert "docs_path" in str(raised.value)
+
+
+def test_t90_a_docs_path_that_does_not_exist_is_refused(tmp_path: Path):
+    """Named-but-absent is a request the caller can correct, so it is refused."""
+
+    root = t90_workspace_root(tmp_path)
+
+    result = t90_run(root, docs_path="extracted/not-here")
+
+    assert result.outcome == "REFUSED"
+    assert result.codes == ("VALIDATION_ERROR",)
+    assert result.journaled is False
+    assert t90_events(root) == [], "a documents preflight refusal is not an indexing run"
+
+
+def test_t90_a_docs_path_that_is_a_file_is_refused(tmp_path: Path):
+    """The field names a directory; a single file is a different request."""
+
+    root = t90_workspace_root(tmp_path)
+    (root / "extracted" / "a-file.md").write_text("not a directory", encoding="utf-8")
+
+    result = t90_run(root, docs_path="extracted/a-file.md")
+
+    assert result.outcome == "REFUSED"
+    assert result.codes == ("VALIDATION_ERROR",)
+    assert result.journaled is False
+    assert t90_events(root) == []
+
+
+@pytest.mark.parametrize(
+    "docs_path",
+    ["/etc", "C:/Windows", "extracted/../../outside", "../elsewhere"],
+)
+def test_t90_an_absolute_or_escaping_docs_path_is_refused(tmp_path: Path, docs_path):
+    """docs_path is bound to the workspace exactly as journal_path is."""
+
+    root = t90_workspace_root(tmp_path)
+
+    result = t90_run(root, docs_path=docs_path)
+
+    assert result.outcome == "REFUSED"
+    assert result.codes == ("VALIDATION_ERROR",)
+
+
+@pytest.mark.parametrize(
+    ("spelling", "description"),
+    [
+        ("ABSOLUTE", "an absolute path to the documents directory itself"),
+        ("TRAVERSAL", "a '..' path that lands on the documents directory itself"),
+    ],
+)
+def test_t90_a_malformed_docs_spelling_is_refused_even_when_it_would_resolve_inside(
+    tmp_path: Path, spelling, description
+):
+    """The shape rules for ``docs_path`` are not merely redundant with containment.
+
+    The same argument as the journal's: both spellings name the *correct*
+    in-workspace documents directory, so only the lexical check can refuse them.
+    Without it, resolved containment would accept them -- and the run would proceed
+    from a request the caller wrote in a shape the service does not accept.
+    """
+
+    root = t90_workspace_root(tmp_path)
+    docs_path = str(root / T90_DOCS) if spelling == "ABSOLUTE" else "elsewhere/../extracted"
+
+    result = t90_run(root, docs_path=docs_path)
+
+    assert result.outcome == "REFUSED", f"{description} must be refused even though it resolves inside"
+    assert result.codes == ("VALIDATION_ERROR",)
+    assert result.journaled is False, "a documents preflight refusal is not an indexing run"
+
+
+def test_t90_a_docs_path_that_covers_no_parent_document_is_refused(tmp_path: Path):
+    """A documents directory that names none of the accepted parent's documents."""
+
+    root = t90_workspace_root(tmp_path)
+    (root / "elsewhere").mkdir()
+
+    result = t90_run(root, docs_path="elsewhere")
+
+    assert result.outcome == "REFUSED", "a docs directory outside the parent's documents decides nothing"
+    assert result.codes == ("VALIDATION_ERROR",)
+    assert result.journaled is False
+    assert t90_events(root) == []
+
+
+def test_t90_a_docs_path_covering_only_some_parent_documents_is_refused(tmp_path: Path):
+    """Partial coverage is refused: indexing part of a parent misreports the corpus.
+
+    `docs_path` is a *scope*, so covering one of two accepted documents is not a
+    smaller valid request -- it is a claim that the other document is not part of
+    this run's corpus, which a complete sidecar would then record for a parent that
+    admitted more.
+
+    The two documents carry different text, and each source names the same
+    `extracted_path` its parent record does, so nothing *else* refuses this run:
+    the only thing wrong with the request is the documents directory.  That is what
+    makes the test able to tell `docs_path` being enforced from `docs_path`
+    being merely validated and then ignored.
+    """
+
+    root = t90_workspace_root(tmp_path)
+    second = "DOC-" + "5" * 32
+    second_text = "# Introduction\n\nA second, differently worded claim for this study.\n"
+    (root / "extracted" / f"{T90_DOCUMENT}.md").write_text(T90_TEXT, encoding="utf-8")
+    (root / "extracted" / f"{second}.md").write_text(second_text, encoding="utf-8")
+    scoped = root / "scoped"
+    scoped.mkdir()
+    # The first document is reachable inside `scoped/`; the second is not.
+    (scoped / f"{T90_DOCUMENT}.md").write_text(T90_TEXT, encoding="utf-8")
+    view = dict(T90_PARENT_VIEW)
+    view["documents"] = [
+        {
+            "document_id": T90_DOCUMENT,
+            "study_id": T90_STUDY,
+            "extracted_path": f"scoped/{T90_DOCUMENT}.md",
+            "extracted_content_sha256": t90_fingerprint(T90_TEXT),
+            "extraction_method": "DETERMINISTIC_RULE",
+        },
+        {
+            "document_id": second,
+            "study_id": T90_STUDY,
+            "extracted_path": f"extracted/{second}.md",
+            "extracted_content_sha256": t90_fingerprint(second_text),
+            "extraction_method": "DETERMINISTIC_RULE",
+        },
+    ]
+
+    result = index_workspace(
+        t90_request(
+            root,
+            sources=(
+                t90_source(T90_DOCUMENT, extracted_path=f"scoped/{T90_DOCUMENT}.md"),
+                t90_source(second, text=second_text),
+            ),
+            parent_view=view,
+            docs_path="scoped",
+        ),
+        backend=T90Store(),
+        reader=T90Store(),
+        embedder=t90_embedder,
+        workspace_root=root,
+    )
+
+    assert result.outcome == "REFUSED", "one of two parent documents is outside the stated docs directory"
+    assert result.codes == ("VALIDATION_ERROR",)
+    assert result.sidecar_path is None, "nothing was indexed from a mis-scoped request"
+    assert result.journaled is False
+    assert t90_events(root) == [], "API and CLI both refuse before a run exists"
+    # The refusal has to be actionable. ``index_workspace`` reports a refusal as a
+    # typed result with no free text in it, so the wording is asserted where it is
+    # raised -- on the check the service and the CLI both call -- and the typed
+    # result above is asserted separately above.
+    with pytest.raises(IndexServiceValidationError) as raised:
+        index_service.require_parent_documents_within_docs_path(
+            view["documents"],
+            docs_path=(root / "scoped").resolve(),
+            workspace_root=root,
+        )
+    reasoning = str(raised.value)
+    assert raised.value.field == "docs_path", "the refusal names the option that was misconfigured"
+    # The knob, not the workspace root: a documents directory that covers only some
+    # of the parent is a wrong ``docs_path``, and the workspace root is fine.
+    assert "docs_path" in reasoning, "the reason must name docs_path, the option actually misconfigured"
+    assert "workspace root" not in reasoning, "docs_path is not the workspace root; do not send the caller there"
+    assert "1 document(s)" in reasoning, "the reason must count the documents that fell outside"
+    assert "position(s) 1" in reasoning, "the reason must locate the offending record in the parent view"
+
+
+def test_t90_a_docs_path_reasoning_names_every_offset_it_counted(tmp_path: Path):
+    """Two documents out of scope: the reason counts 2 and lists both offsets.
+
+    This is the assertion that makes the count load-bearing.  Reporting only the
+    first offender while still claiming to have counted would leave a caller with
+    a scope mismatch they fix once and hit again; and an aggregation branch that
+    can never be reached (because the per-document check raises first) is a branch
+    that is never exercised.  Three documents out of scope with positions 1 and 3
+    out of scope is what separates "counts something" from "counts and locates
+    every one of them" -- a run that reported `2 document(s) at position(s) 1`
+    would pass a count-only check and fail here.
+    """
+
+    root = t90_workspace_root(tmp_path)
+    # Positions 0, 2 are inside docs_path; 1 and 3 are not, and sit in different
+    # directories so the refusal cannot be satisfied by matching one parent path.
+    outside_paths = ["loose/one.md", "other/two.md"]
+    records = []
+    sources = []
+    for position, document_id in enumerate(["DOC-" + str(n) * 32 for n in (1, 2, 3, 4)]):
+        text = f"# Document {position}\n\nA claim number {position} for this study.\n"
+        if position in (1, 3):
+            relative = outside_paths[(position - 1) // 2]
+        else:
+            relative = f"scoped/{document_id}.md"
+        (root / relative).parent.mkdir(parents=True, exist_ok=True)
+        (root / relative).write_text(text, encoding="utf-8")
+        records.append(
+            {
+                "document_id": document_id,
+                "study_id": T90_STUDY,
+                "extracted_path": relative,
+                "extracted_content_sha256": t90_fingerprint(text),
+                "extraction_method": "DETERMINISTIC_RULE",
+            }
+        )
+        sources.append(t90_source(document_id, text=text, extracted_path=relative))
+    (root / "scoped").mkdir(exist_ok=True)
+    view = dict(T90_PARENT_VIEW)
+    view["documents"] = records
+
+    result = index_workspace(
+        t90_request(root, sources=tuple(sources), parent_view=view, docs_path="scoped"),
+        backend=T90Store(),
+        reader=T90Store(),
+        embedder=t90_embedder,
+        workspace_root=root,
+    )
+
+    assert result.outcome == "REFUSED", "two of four parent documents are outside the stated docs directory"
+    assert result.codes == ("VALIDATION_ERROR",)
+    assert result.sidecar_path is None, "nothing was indexed from a mis-scoped request"
+
+    with pytest.raises(IndexServiceValidationError) as raised:
+        index_service.require_parent_documents_within_docs_path(
+            records, docs_path=(root / "scoped").resolve(), workspace_root=root
+        )
+    reasoning = str(raised.value)
+    assert "docs_path" in reasoning, "the reason must name docs_path, the option actually misconfigured"
+    assert "workspace root" not in reasoning, "docs_path is not the workspace root; do not send the caller there"
+    assert "2 document(s)" in reasoning, "the count must be the real number of offenders, not the first one"
+    assert "position(s) 1, 3" in reasoning, "every offset that was counted must also be located"
+    # Positions 0 and 2 resolve inside docs_path, so the listed offsets are exactly
+    # {1, 3} -- a count of 2 naming 0 and 2 would pass the two assertions above while
+    # locating documents that are in scope.
+    listed = re.search(r"position\(s\) ([0-9, ]+?) in ", reasoning)
+    assert listed is not None, "the reason must list the offending positions"
+    assert {int(offset) for offset in listed.group(1).split(",")} == {1, 3}
+
+
+# -- durability: one append, serialized, flushed, fsync'd before the result ---
+
+
+def test_t90_concurrent_appends_each_land_as_one_whole_event(tmp_path: Path):
+    """N threads appending N events produce N parsable lines, none interleaved."""
+
+    destination = tmp_path / "kit" / "events.jsonl"
+    destination.parent.mkdir(parents=True)
+    threads_count = 8
+    barrier = threading.Barrier(threads_count)
+
+    def append(index: int) -> None:
+        barrier.wait()
+        index_service.append_run_event(destination, {"n": index, "pad": "x" * 512})
+
+    threads = [threading.Thread(target=append, args=(index,)) for index in range(threads_count)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    lines = [line for line in destination.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert len(lines) == threads_count, "one event per caller, no lost appends"
+    assert sorted(json.loads(line)["n"] for line in lines) == list(range(threads_count)), (
+        "every line is one whole parsable event; an interleaved write would not parse"
+    )
+
+
+def test_t90_an_fsync_failure_is_a_typed_dependency_failure_not_a_swallowed_error(tmp_path: Path, monkeypatch):
+    """The bytes reached the page cache but not the disk: that is a failed append."""
+
+    destination = tmp_path / "events.jsonl"
+
+    def refuse_fsync(self):
+        raise OSError("simulated fsync failure")
+
+    monkeypatch.setattr(index_service.os, "fsync", refuse_fsync)
+
+    with pytest.raises(index_service.JournalDependencyError):
+        index_service.append_run_event(destination, {"n": 1})
+
+    # The service-level consequence: no success, no journaled claim.
+    root = t90_workspace_root(tmp_path, "ws")
+    monkeypatch.setattr(index_service.os, "fsync", refuse_fsync)
+    result = t90_run(root)
+
+    assert result.outcome == "FAILED"
+    assert JOURNAL_DEPENDENCY_CODE in result.codes
+    assert result.journaled is False, "a run whose event was not fsync'd never claims it was appended"
+    assert result.complete is False
+    assert result.sidecar_path is None
+
+
+def test_t90_the_append_is_flushed_and_fsyncd_before_the_result(tmp_path: Path, monkeypatch):
+    """The durability calls are not decoration: they happen, inside the lock."""
+
+    destination = tmp_path / "events.jsonl"
+    order: list[str] = []
+    real_fsync = os.fsync
+
+    def record_fsync(fd):
+        order.append("fsync")
+        return real_fsync(fd)
+
+    monkeypatch.setattr(index_service.os, "fsync", record_fsync)
+    index_service.append_run_event(destination, {"n": 1})
+    order.append("returned")
+    assert order == ["fsync", "returned"], "the fsync happens before the append returns to its caller"
+
+
+def test_t90_the_durability_guarantee_is_not_overclaimed(tmp_path: Path):
+    """The docstring promises an in-process lock and an fsync, and no more.
+
+    A guarantee of cross-process exclusion would be a claim this module cannot make
+    -- the lock is a module-level ``threading.Lock`` -- so the prose is checked for
+    the honest scope rather than left to a reader's imagination.
+    """
+
+    doc = inspect.getdoc(index_service.append_run_event) or ""
+
+    assert "in a single OS append call" in doc
+    assert "fsync" in doc
+    assert "cross-process" in doc, "the limitation is stated, not left implied"
+    assert "not* claimed" in doc or "is not claimed" in doc
+
+
+# -- the frozen primitives are preserved, and stay journal-free -------------
+
+
+def test_t90_the_frozen_primitives_are_imported_not_reimplemented():
+    """The service composes T-40/T-50/T-60/T-70/T-80; it owns no machinery."""
+
+    source = inspect.getsource(index_service)
+    assert "from scholar_rag.replacement import" in source
+    assert "IndexReplacement" in source
+    assert "verify_backend(" in source
+    assert "IndexRecovery" in source
+    assert "compute_fingerprints(" in source
+    assert "MarkdownChunker" in source
+    # No second copy of a frozen rule: the service never mints or re-derives an
+    # identity with a rule of its own.
+    assert "def mint_chunk_id" not in source
+    assert "def derive_chunk_id" not in source
+    assert "def compute_fingerprints" not in source
+
+
+def test_t90_the_frozen_modules_still_never_write_a_journal():
+    """The kit run report belongs to the service boundary, not to the primitives.
+
+    Checked against the modules' *code*, not their prose: a docstring that names
+    ``audit/journal.jsonl`` to say it is never written is exactly the frozen claim,
+    so the assertion looks for an actual open/append at that path.
+    """
+
+    for module in (replacement, recovery, index_verifier):
+        source = inspect.getsource(module)
+        for node in ast.walk(ast.parse(source)):
+            # An executable ``.append(...)`` or ``open(...)`` mentioning a journal.
+            # Prose is excluded because these modules *must* keep saying in their
+            # docstrings that the acceptance event belongs to the adapter.
+            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+                continue
+            if node.func.attr not in {"append", "write", "open"}:
+                continue
+            spelled = ast.unparse(node)
+            if "journal" in spelled.lower():
+                raise AssertionError(
+                    f"{module.__name__} writes a journal ({spelled!r}): the acceptance adapter owns that (6.1, G-9)"
+                )
+        assert "journal" in source.lower(), (
+            f"{module.__name__} should still say in prose that the acceptance event is the adapter's"
+        )
+
+
+def test_t90_the_service_imports_no_harness_module():
+    """G-9: the kit is the kit, and never reaches across into the harness."""
+
+    source = inspect.getsource(index_service) + inspect.getsource(cli)
+    assert "scholar_harness" not in source
+    assert "ContractRegistry" not in source
+    assert "plugins.json" not in source
