@@ -3273,7 +3273,7 @@ wheels = [
 [[package]]
 name = "scholar-bib-kit"
 version = "0.1.0"
-source = { editable = "../scholar-bib-kit" }
+source = { git = "https://github.com/nexus-scholar-org/scholar-bib-kit?rev=0bf3cdd2d0ace6dc626f033871747a78681c6ddf#0bf3cdd2d0ace6dc626f033871747a78681c6ddf" }
 dependencies = [
     { name = "bibtexparser" },
     { name = "pydantic" },
@@ -3282,19 +3282,10 @@ dependencies = [
     { name = "typer" },
 ]
 
-[package.metadata]
-requires-dist = [
-    { name = "bibtexparser", specifier = ">=2.0.0b7" },
-    { name = "pydantic", specifier = ">=2.0.0" },
-    { name = "rich", specifier = ">=13.0.0" },
-    { name = "scholar-search-kit", editable = "../scholar-search-kit" },
-    { name = "typer", specifier = ">=0.9.0" },
-]
-
 [[package]]
 name = "scholar-graph-kit"
 version = "0.1.0"
-source = { editable = "../scholar-graph-kit" }
+source = { git = "https://github.com/nexus-scholar-org/scholar-graph-kit?rev=4f0f4382ad4c940b2a3da838a12f1b47affd2b31#4f0f4382ad4c940b2a3da838a12f1b47affd2b31" }
 dependencies = [
     { name = "aiohttp" },
     { name = "networkx" },
@@ -3305,15 +3296,14 @@ dependencies = [
     { name = "typer" },
 ]
 
-[package.metadata]
-requires-dist = [
-    { name = "aiohttp", specifier = ">=3.9.0" },
-    { name = "networkx", specifier = ">=3.0" },
-    { name = "pydantic", specifier = ">=2.0.0" },
-    { name = "pyvis", specifier = ">=0.3.2" },
-    { name = "rich", specifier = ">=13.0.0" },
-    { name = "scholar-search-kit", editable = "../scholar-search-kit" },
-    { name = "typer", specifier = ">=0.9.0" },
+[[package]]
+name = "scholar-protocol-kit"
+version = "1.0.0"
+source = { git = "https://github.com/nexus-scholar-org/scholar-protocol-kit?rev=4e10f25c25a1b150ce518348d211c7771683a9b7#4e10f25c25a1b150ce518348d211c7771683a9b7" }
+dependencies = [
+    { name = "pydantic" },
+    { name = "rich" },
+    { name = "typer" },
 ]
 
 [[package]]
@@ -3329,6 +3319,7 @@ dependencies = [
     { name = "rich" },
     { name = "scholar-bib-kit" },
     { name = "scholar-graph-kit" },
+    { name = "scholar-protocol-kit" },
     { name = "scholar-search-kit" },
     { name = "sentence-transformers" },
     { name = "typer" },
@@ -3354,9 +3345,10 @@ requires-dist = [
     { name = "pytest-cov", marker = "extra == 'dev'", specifier = ">=4.0.0" },
     { name = "rich", specifier = ">=13.0.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.1.0" },
-    { name = "scholar-bib-kit", editable = "../scholar-bib-kit" },
-    { name = "scholar-graph-kit", editable = "../scholar-graph-kit" },
-    { name = "scholar-search-kit", editable = "../scholar-search-kit" },
+    { name = "scholar-bib-kit", git = "https://github.com/nexus-scholar-org/scholar-bib-kit?rev=0bf3cdd2d0ace6dc626f033871747a78681c6ddf" },
+    { name = "scholar-graph-kit", git = "https://github.com/nexus-scholar-org/scholar-graph-kit?rev=4f0f4382ad4c940b2a3da838a12f1b47affd2b31" },
+    { name = "scholar-protocol-kit", git = "https://github.com/nexus-scholar-org/scholar-protocol-kit?rev=4e10f25c25a1b150ce518348d211c7771683a9b7" },
+    { name = "scholar-search-kit", git = "https://github.com/nexus-scholar-org/scholar-search-kit?rev=911d864fcb6a706d4c0339f80524a46f591e2cad" },
     { name = "sentence-transformers", specifier = ">=2.3.1" },
     { name = "typer", specifier = ">=0.9.0" },
 ]
@@ -3365,7 +3357,7 @@ provides-extras = ["dev"]
 [[package]]
 name = "scholar-search-kit"
 version = "0.1.0"
-source = { editable = "../scholar-search-kit" }
+source = { git = "https://github.com/nexus-scholar-org/scholar-search-kit?rev=911d864fcb6a706d4c0339f80524a46f591e2cad#911d864fcb6a706d4c0339f80524a46f591e2cad" }
 dependencies = [
     { name = "hishel" },
     { name = "httpx" },
@@ -3374,20 +3366,6 @@ dependencies = [
     { name = "rich" },
     { name = "typer" },
 ]
-
-[package.metadata]
-requires-dist = [
-    { name = "hishel", specifier = "==0.0.32" },
-    { name = "httpx", specifier = ">=0.28.1" },
-    { name = "pydantic", specifier = ">=2.0.0" },
-    { name = "pydantic-settings", specifier = ">=2.0.0" },
-    { name = "pytest", marker = "extra == 'dev'", specifier = ">=7.0.0" },
-    { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.21.0" },
-    { name = "rich", specifier = ">=13.9.4" },
-    { name = "typer", specifier = ">=0.9.0" },
-    { name = "vcrpy", marker = "extra == 'dev'", specifier = ">=5.0.0" },
-]
-provides-extras = ["dev"]
 
 [[package]]
 name = "scikit-learn"
