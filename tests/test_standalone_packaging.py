@@ -29,11 +29,14 @@ DIRECT_REF = re.compile(
     r"^scholar-[a-z0-9-]+(\[[a-z0-9,.-]+\])? @ git\+https://github\.com/nexus-scholar-org/scholar-[a-z0-9-]+@[0-9a-f]{40}$"
 )
 
-# The canonical main SHAs recorded at E3/T-110 dispatch time.
+# The canonical main SHAs these siblings are pinned to. Tracked to the merged
+# canonical mains after bib#1/graph#1 merged at 21:50Z (T-110-REPIN); the
+# structural DIRECT_REF regex and the full-40-hex requirement are unchanged, so
+# this mirror tracks the pins rather than relaxing what the guard enforces.
 EXPECTED_SHA = {
     "scholar-protocol-kit": "4e10f25c25a1b150ce518348d211c7771683a9b7",
-    "scholar-graph-kit": "4f0f4382ad4c940b2a3da838a12f1b47affd2b31",
-    "scholar-bib-kit": "0bf3cdd2d0ace6dc626f033871747a78681c6ddf",
+    "scholar-graph-kit": "646b84cec215ebd9b7b449448bca879492e78492",
+    "scholar-bib-kit": "fbdd38ba25301e613621f18119623f04d2673dca",
     "scholar-search-kit": "911d864fcb6a706d4c0339f80524a46f591e2cad",
 }
 
