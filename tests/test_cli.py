@@ -349,12 +349,14 @@ def test_cli_refuses_a_docs_path_that_does_not_exist_and_one_that_is_a_file(tmp_
         ),
     )
     assert missing.exit_code == 2, "a documents directory that is not there is refused"
+    assert "journaled: False" in _plain(missing.output)
 
     as_file = root / "extracted" / f"{document_id}.md"
     result = runner.invoke(
         app, _index_surface_args(tmp_path, as_file, view_path, _kit_journal(root), workspace_root=root)
     )
     assert result.exit_code == 2, "a single file is not a documents directory"
+    assert "journaled: False" in _plain(result.output)
 
 
 def test_cli_refuses_a_docs_path_covering_no_parent_document(tmp_path):
@@ -369,6 +371,7 @@ def test_cli_refuses_a_docs_path_covering_no_parent_document(tmp_path):
     )
 
     assert result.exit_code == 2, "an unrelated directory decides nothing about this parent's documents"
+    assert "journaled: False" in _plain(result.output)
 
 
 def _partially_covered_workspace(tmp_path, name):
@@ -441,6 +444,29 @@ def test_cli_partial_docs_path_reasoning_names_docs_path_count_and_offsets(tmp_p
     assert envelope["outcome"] == "REFUSED", "the machine surface carries the same verdict"
     assert "VALIDATION_ERROR" in envelope["codes"]
     assert envelope["counts"] == {"accepted_documents": 0, "rejected_documents": 0, "visible_chunks": 0}
+    assert envelope["journaled"] is False
+
+
+@pytest.mark.parametrize("bad_path", ["   ", "/outside/paper.md", "../outside/paper.md"])
+def test_cli_attributes_malformed_parent_paths_to_the_record_not_docs_path(tmp_path, bad_path):
+    """Record-shape failures name the record before the selector is evaluated."""
+
+    root, view_path, _ = _admitted_workspace(tmp_path, "ws-record-path")
+    view = json.loads(view_path.read_text(encoding="utf-8"))
+    view["documents"][0]["extracted_path"] = bad_path
+    view_path.write_text(json.dumps(view), encoding="utf-8")
+
+    result = runner.invoke(
+        app,
+        _index_surface_args(tmp_path, root / "extracted", view_path, _kit_journal(root), workspace_root=root),
+    )
+    text = " ".join(_plain(result.output).split())
+
+    assert result.exit_code == 2
+    assert "parent_view.documents.0.extracted_path" in text
+    assert "refuses docs_path" not in text
+    assert "journaled: False" in text
+    assert not _kit_journal(root).exists()
 
 
 def test_cli_binds_a_relative_journal_reference_to_the_workspace_not_the_cwd(tmp_path, monkeypatch, offline_embedder):

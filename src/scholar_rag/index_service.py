@@ -290,6 +290,17 @@ class IndexServiceValidationError(IndexServiceError):
     code = "VALIDATION_ERROR"
 
 
+class IndexServicePreflightError(IndexServiceValidationError):
+    """A caller-controlled refusal discovered before an indexing run begins.
+
+    The CLI has to validate the documents directory and bind parent records before
+    it can construct :class:`IndexServiceRequest`; the Python service repeats those
+    checks defensively. Keeping this distinction typed lets both surfaces report
+    the same unjournaled refusal instead of making the service claim that a run
+    existed when the CLI could not yet assemble one.
+    """
+
+
 class JournalDependencyError(IndexServiceError):
     """The journal destination is unusable: absent, unstated, or unwritable.
 
@@ -464,6 +475,7 @@ class IndexServiceRequest(BaseModel):
                 "the acceptance adapter rather than discovered here.",
                 field="parent_view.documents",
             )
+        require_parent_document_path_shapes(documents)
         seen_parent_documents: set[str] = set()
         for position, record in enumerate(documents):
             if not isinstance(record, Mapping):
@@ -811,6 +823,15 @@ def index_workspace(
         # ``_failure`` never journals, so it needs no workspace root: the run could
         # not state a usable destination, which is precisely why nothing is appended.
         return _failure(request, zero, exc, recovery_state=None)
+    except IndexServicePreflightError as exc:
+        return IndexServiceResult(
+            run_id=request.run_id,
+            outcome="REFUSED",
+            complete=False,
+            counts=zero,
+            codes=(exc.code,),
+            journaled=False,
+        )
     except IndexServiceError as exc:
         return _refused(request, zero, exc, recovery_state=None, workspace_root=workspace_root)
     except (IndexManifestError, ValidationError) as exc:  # a T-50 or pydantic refusal
@@ -1769,15 +1790,16 @@ def require_parent_documents_within_docs_path(
     so each is joined to the workspace root and then required to land inside
     ``docs_path``.  The decision is made on resolved paths, so a document reached
     through a link out of the documents directory is refused the same way a ``..``
-    reference is.  Records that are not mappings, or that name no
-    ``extracted_path``, are left to the surface that assembles the sources to
-    refuse by name: this check answers the scope question, not the shape one.
+    reference is. Record shape is validated first and attributed to the offending
+    ``parent_view.documents.<position>.extracted_path`` field; only well-shaped
+    references reach this scope decision.
 
     Both surfaces call this one function -- the service here, and the CLI before
     it binds a single file -- so the two cannot answer the same parent view with
     different reasoning (**E3-NEG-040** / **E3-NEG-041**).
     """
 
+    require_parent_document_path_shapes(records)
     root = resolved_workspace_root(workspace_root)
     outside = [
         (position, (root / record["extracted_path"]).resolve())
@@ -1789,7 +1811,7 @@ def require_parent_documents_within_docs_path(
     if not outside:
         return
     positions = ", ".join(str(position) for position, _ in outside)
-    raise IndexServiceValidationError(
+    raise IndexServicePreflightError(
         f"index service refuses docs_path {str(docs_path)!r}: the accepted parent view names "
         f"{len(outside)} document(s) at position(s) {positions} in 'documents' that do not resolve inside "
         f"it. The first of those resolves to {str(outside[0][1])!r}, which is outside that directory. "
@@ -1799,6 +1821,33 @@ def require_parent_documents_within_docs_path(
         "admit.",
         field="docs_path",
     )
+
+
+def require_parent_document_path_shapes(records: Sequence[Any]) -> None:
+    """Validate parent-record path syntax before deciding document scope.
+
+    A malformed ``extracted_path`` is a defect in that parent record, not evidence
+    that the caller selected the wrong ``docs_path``. Running this check first keeps
+    the CLI and Python API on the same field attribution and prevents an absolute or
+    escaping record path from being resolved merely to count it as out of scope.
+    """
+
+    for position, record in enumerate(records):
+        field = f"parent_view.documents.{position}.extracted_path"
+        if not isinstance(record, Mapping):
+            raise IndexServiceValidationError(
+                f"index service refuses parent_view.documents.{position}: it is not a mapping of the "
+                "record's own fields.",
+                field=f"parent_view.documents.{position}",
+            )
+        value = record.get("extracted_path")
+        if not isinstance(value, str) or not value.strip():
+            raise IndexServiceValidationError(
+                f"index service refuses {field}: the accepted parent record does not state a non-blank "
+                "workspace-relative extracted path.",
+                field=field,
+            )
+        _refuse_path_shaped(value, field)
 
 
 def _resolves_within(resolved: Path, root: Path) -> bool:
@@ -1931,16 +1980,19 @@ def require_extracted_documents_directory(raw: Any, root: Path) -> Path:
     and hides the caller's actual mistake.
     """
 
-    docs = _workspace_relative_destination(raw, root, field="docs_path")
+    try:
+        docs = _workspace_relative_destination(raw, root, field="docs_path")
+    except IndexServiceValidationError as exc:
+        raise IndexServicePreflightError(str(exc), field="docs_path") from None
     if not docs.exists():
-        raise IndexServiceValidationError(
+        raise IndexServicePreflightError(
             f"index service refuses docs_path {field_relative(docs, root)!r}: no such directory in the stated "
             f"workspace {str(root)!r}. A documents directory that is not there is a request the caller can "
             "correct, so it is refused here rather than becoming an empty successful index.",
             field="docs_path",
         )
     if not docs.is_dir():
-        raise IndexServiceValidationError(
+        raise IndexServicePreflightError(
             f"index service refuses docs_path {field_relative(docs, root)!r}: it exists but is not a directory. "
             "This field names the directory of extracted documents, not one file.",
             field="docs_path",

@@ -2155,10 +2155,8 @@ def test_t90_a_docs_path_that_does_not_exist_is_refused(tmp_path: Path):
 
     assert result.outcome == "REFUSED"
     assert result.codes == ("VALIDATION_ERROR",)
-    # The destination was fine, so the refusal itself *is* recorded -- at this kit's
-    # own destination. What was refused is the run, not the audit trail.
-    assert result.journaled is True
-    assert [event["action"] for event in t90_events(root)] == [ACTION_RUN_REJECTED]
+    assert result.journaled is False
+    assert t90_events(root) == [], "a documents preflight refusal is not an indexing run"
 
 
 def test_t90_a_docs_path_that_is_a_file_is_refused(tmp_path: Path):
@@ -2171,6 +2169,8 @@ def test_t90_a_docs_path_that_is_a_file_is_refused(tmp_path: Path):
 
     assert result.outcome == "REFUSED"
     assert result.codes == ("VALIDATION_ERROR",)
+    assert result.journaled is False
+    assert t90_events(root) == []
 
 
 @pytest.mark.parametrize(
@@ -2213,7 +2213,7 @@ def test_t90_a_malformed_docs_spelling_is_refused_even_when_it_would_resolve_ins
 
     assert result.outcome == "REFUSED", f"{description} must be refused even though it resolves inside"
     assert result.codes == ("VALIDATION_ERROR",)
-    assert result.journaled is True, "the refusal is itself recorded; only the run was refused"
+    assert result.journaled is False, "a documents preflight refusal is not an indexing run"
 
 
 def test_t90_a_docs_path_that_covers_no_parent_document_is_refused(tmp_path: Path):
@@ -2226,6 +2226,8 @@ def test_t90_a_docs_path_that_covers_no_parent_document_is_refused(tmp_path: Pat
 
     assert result.outcome == "REFUSED", "a docs directory outside the parent's documents decides nothing"
     assert result.codes == ("VALIDATION_ERROR",)
+    assert result.journaled is False
+    assert t90_events(root) == []
 
 
 def test_t90_a_docs_path_covering_only_some_parent_documents_is_refused(tmp_path: Path):
@@ -2289,7 +2291,8 @@ def test_t90_a_docs_path_covering_only_some_parent_documents_is_refused(tmp_path
     assert result.outcome == "REFUSED", "one of two parent documents is outside the stated docs directory"
     assert result.codes == ("VALIDATION_ERROR",)
     assert result.sidecar_path is None, "nothing was indexed from a mis-scoped request"
-    assert [event["action"] for event in t90_events(root)] == [ACTION_RUN_REJECTED]
+    assert result.journaled is False
+    assert t90_events(root) == [], "API and CLI both refuse before a run exists"
     # The refusal has to be actionable. ``index_workspace`` reports a refusal as a
     # typed result with no free text in it, so the wording is asserted where it is
     # raised -- on the check the service and the CLI both call -- and the typed
