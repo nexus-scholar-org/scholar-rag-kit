@@ -52,6 +52,9 @@ from scholar_rag.chunker import (
     mint_chunk_id,
     text_fingerprint,
 )
+from scholar_rag.index_models import IdentityMissingError, IndexDocumentRequest
+from scholar_rag.indexer import ScholarIndexer
+from scholar_rag.models import ChunkMetadata
 
 # ---------------------------------------------------------------------------
 # Frozen literals, copied from the T-10 golden battery (tests/test_canonical.py).
@@ -691,3 +694,134 @@ def test_the_chunk_id_must_be_derived_only_through_the_canonical_mint():
     assert not hasattr(MarkdownChunker, "resolved_doc_id")
     source = MarkdownChunker.chunk.__doc__ or ""
     assert "chk-" not in source
+
+
+# ---------------------------------------------------------------------------
+# ``PERSISTED-LIMBS`` -- the identity limbs must survive the store write.
+#
+# Minting a chunk id from all six limbs is necessary but not sufficient: a
+# consumer that reads the store (``matrix``, ``index_verifier``) can only
+# recover a study from limbs that were actually persisted. These tests pin the
+# model, the chunker handoff and the stored row, because the limb being minted
+# and the limb being readable are two different properties.
+# ---------------------------------------------------------------------------
+
+
+def test_chunk_metadata_carries_and_emits_the_typed_identity_limbs():
+    meta = ChunkMetadata(chunk_id="CHK-00000000000000000000000000000000", **IDENTITY_BLOCK)
+    emitted = meta.to_chroma_metadata()
+
+    assert emitted["study_id"] == IDENTITY_BLOCK["study_id"]
+    assert emitted["document_id"] == IDENTITY_BLOCK["document_id"]
+    # Round-trip through the flattened form: the two limbs survive it unchanged.
+    rebuilt = ChunkMetadata(
+        chunk_id=meta.chunk_id,
+        study_id=emitted["study_id"],
+        document_id=emitted["document_id"],
+    )
+    assert rebuilt.study_id == meta.study_id
+    assert rebuilt.document_id == meta.document_id
+    # Chroma accepts only primitives, so the emitted dict stays flat.
+    assert all(isinstance(value, (str, int, float, bool)) for value in emitted.values())
+
+
+def test_chunk_metadata_omits_absent_identity_limbs_rather_than_guessing_them():
+    # A legacy ChunkMetadata with no typed limbs must not acquire a study id
+    # inferred from the workspace, DOI or filename.
+    emitted = ChunkMetadata(
+        chunk_id="legacy",
+        workspace_id="SCI-000001",
+        doi="10.1000/x",
+        filename="paper.md",
+    ).to_chroma_metadata()
+
+    assert "study_id" not in emitted
+    assert "document_id" not in emitted
+    assert emitted["workspace_id"] == "SCI-000001"
+
+
+def test_chunker_hands_the_identity_limbs_to_the_chunk_metadata():
+    chunks = MarkdownChunker().chunk(SAMPLE_DOC, base_metadata=dict(IDENTITY_BLOCK))
+
+    assert chunks
+    for chunk in chunks:
+        assert chunk.metadata.study_id == IDENTITY_BLOCK["study_id"]
+        assert chunk.metadata.document_id == IDENTITY_BLOCK["document_id"]
+        emitted = chunk.metadata.to_chroma_metadata()
+        assert emitted["study_id"] == IDENTITY_BLOCK["study_id"]
+        assert emitted["document_id"] == IDENTITY_BLOCK["document_id"]
+
+
+def test_frontmatter_cannot_supply_or_override_a_persisted_study_limb():
+    # The limbs are minted from base_metadata and re-applied over frontmatter,
+    # so a document's own YAML block can neither invent nor restate them.
+    doc = """---
+study_id: STU-attacker-supplied
+document_id: DOC-attacker-supplied
+---
+# Introduction
+
+Some text.
+"""
+    chunks = MarkdownChunker().chunk(doc, base_metadata=dict(IDENTITY_BLOCK))
+    assert chunks
+    for chunk in chunks:
+        emitted = chunk.metadata.to_chroma_metadata()
+        assert emitted["study_id"] == IDENTITY_BLOCK["study_id"]
+        assert emitted["document_id"] == IDENTITY_BLOCK["document_id"]
+
+
+def test_the_typed_request_identity_limbs_reach_the_stored_row(tmp_path):
+    # End-to-end over the real store: what the request stated is what a later
+    # consumer reads back. This is the property matrix and index_verifier need
+    # and the one that was silently absent.
+    indexer = ScholarIndexer(
+        db_path=str(tmp_path / "db"),
+        collection_name="scholar_docs",
+        embedder_kwargs={"provider": "mock"},
+    )
+    request = IndexDocumentRequest(
+        workspace_id=IDENTITY_BLOCK["workspace_id"],
+        study_id=IDENTITY_BLOCK["study_id"],
+        document_id=IDENTITY_BLOCK["document_id"],
+        parent_artifact_id=IDENTITY_BLOCK["parent_artifact_id"],
+        parent_artifact_sha256=IDENTITY_BLOCK["parent_artifact_sha256"],
+        extracted_content_sha256=IDENTITY_BLOCK["extracted_content_sha256"],
+        backend_provider="mock",
+        collection="scholar_docs",
+    )
+    indexer.index_markdown(SAMPLE_DOC, request=request)
+
+    stored = indexer.collection.get(include=["metadatas"])
+    assert stored["metadatas"]
+    for meta in stored["metadatas"]:
+        assert meta["study_id"] == IDENTITY_BLOCK["study_id"]
+        assert meta["document_id"] == IDENTITY_BLOCK["document_id"]
+
+
+def test_a_typed_request_omitting_identity_is_refused_and_persists_nothing(tmp_path):
+    # Negative (E3-004). Persisting the limbs must not make the typed boundary
+    # optional: a request naming only a workspace is a missing-identity failure.
+    indexer = ScholarIndexer(
+        db_path=str(tmp_path / "db"),
+        collection_name="scholar_docs",
+        embedder_kwargs={"provider": "mock"},
+    )
+    with pytest.raises(IdentityMissingError) as excinfo:
+        indexer.index_markdown(
+            SAMPLE_DOC,
+            request=IndexDocumentRequest.model_construct(
+                workspace_id=IDENTITY_BLOCK["workspace_id"],
+                study_id=None,
+                document_id=None,
+                parent_artifact_id=IDENTITY_BLOCK["parent_artifact_id"],
+                parent_artifact_sha256=IDENTITY_BLOCK["parent_artifact_sha256"],
+                extracted_content_sha256=IDENTITY_BLOCK["extracted_content_sha256"],
+                backend_provider="mock",
+                collection="scholar_docs",
+            ),
+        )
+    assert excinfo.value.code == "IDENTITY_MISSING"
+    assert "study_id" in excinfo.value.missing
+    assert "document_id" in excinfo.value.missing
+    assert indexer.collection.count() == 0

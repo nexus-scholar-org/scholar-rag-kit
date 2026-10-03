@@ -762,6 +762,12 @@ class MarkdownChunker:
                 meta = ChunkMetadata(
                     chunk_id=chunk_id,
                     workspace_id=merged_meta.get("workspace_id"),
+                    # Minted from the accepted identity block above, so these are
+                    # the same values the id is bound to. Dropping them here is
+                    # what previously made a chunk's study unreadable from the
+                    # store while its id still encoded it.
+                    study_id=merged_meta.get("study_id"),
+                    document_id=merged_meta.get("document_id"),
                     paper_id=merged_meta.get("paper_id"),
                     doi=merged_meta.get("doi"),
                     filename=merged_meta.get("filename", ""),

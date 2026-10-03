@@ -101,6 +101,47 @@ class MatrixExtractor:
         except Exception:
             pass
 
+    @staticmethod
+    def _resolve_scope(
+        study_id: str,
+        *,
+        scope_study_id: str | None = None,
+        document_id: str | None = None,
+        workspace_id: str | None = None,
+        doi: str | None = None,
+    ) -> dict[str, str]:
+        """The store filter that scopes one matrix row's retrieval.
+
+        ``scope_study_id`` is the stored study limb and leads, because it is the
+        only limb that spans a whole study: a study may own several documents,
+        and scoping on any one of them would drop the study's other documents
+        from every cell -- and would make the cell depend on which document the
+        store happened to return first.
+
+        The rest (``document_id``, ``doi``, ``workspace_id``) are the **legacy**
+        chain, reached only for a row that genuinely carries no stored
+        ``study_id``. When a caller supplies none of the four (a direct
+        :meth:`extract_study` call that only knows the row label), the historical
+        inference applies: a label that reads as a DOI filters on ``doi``,
+        anything else on ``workspace_id``.
+
+        The stored study limb is passed as its own argument and never read off
+        the row label, so the legacy label-inference stays wired only to the
+        legacy channel. No study identity is derived from a workspace, a DOI or
+        a filename for a row that has a typed limb.
+        """
+
+        if scope_study_id:
+            return {"study_id": scope_study_id}
+        if document_id:
+            return {"document_id": document_id}
+        if doi:
+            return {"doi": doi}
+        if workspace_id:
+            return {"workspace_id": workspace_id}
+        inferred_doi = study_id if ("/" in study_id or "." in study_id) else None
+        return {"doi": inferred_doi} if inferred_doi else {"workspace_id": study_id}
+
     def extract_study(
         self,
         study_id: str,
@@ -108,9 +149,20 @@ class MatrixExtractor:
         authors: str = "",
         year: int | str = "",
         llm_callable: Callable[[str], dict[str, Any]] | None = None,
+        *,
+        scope_study_id: str | None = None,
+        document_id: str | None = None,
+        workspace_id: str | None = None,
+        doi: str | None = None,
     ) -> dict[str, Any]:
         """
         Extracts all protocol dimensions for a single study using targeted section retrieval.
+
+        ``study_id`` is the row **label**. It is not a store filter, and the
+        retrieval scope is carried separately by ``scope_study_id`` (the stored
+        study limb) or, for a legacy row, by ``document_id``/``doi``/
+        ``workspace_id``. Passing the label as the scope would re-wire the
+        legacy label-inference onto typed rows. See :meth:`_resolve_scope`.
         """
         record: dict[str, Any] = {
             "study_id": study_id,
@@ -119,18 +171,23 @@ class MatrixExtractor:
             "year": str(year) if year else "",
         }
 
+        scope = self._resolve_scope(
+            study_id,
+            scope_study_id=scope_study_id,
+            document_id=document_id,
+            workspace_id=workspace_id,
+            doi=doi,
+        )
+
         # For each dimension in protocol.matrix_dimensions:
         for dim in self.dimensions:
             target_category = dim.target_section_category
-            doi = study_id if "/" in study_id or "." in study_id else None
-            ws_id = study_id if not doi else None
 
-            # Query relevant chunks for this dimension, scoped to the study's workspace_id or DOI
+            # Query relevant chunks for this dimension, scoped to the stored limbs
             relevant_chunks = self.retriever.query(
                 query_text=f"{dim.name} {dim.description}",
                 n_results=3,
-                doi=doi,
-                workspace_id=ws_id,
+                where_filter=scope,
                 section_category=target_category if target_category else None,
                 log_journal=False,
             )
@@ -141,8 +198,7 @@ class MatrixExtractor:
                 relevant_chunks = self.retriever.query(
                     query_text=f"{dim.name} {dim.description}",
                     n_results=3,
-                    doi=doi,
-                    workspace_id=ws_id,
+                    where_filter=scope,
                     section_category=target_category if target_category else None,
                     log_journal=False,
                 )
@@ -204,8 +260,18 @@ class MatrixExtractor:
             for meta in records["metadatas"]:
                 if not meta:
                     continue
+                # The typed study limb leads. It is the value the chunk id was
+                # minted from, so it is the only limb that can tell two studies
+                # in the same workspace apart; reading the workspace first would
+                # merge them, and a workspace is not a study identity (E3-004).
+                #
+                # The chain below is the LEGACY fallback and is kept on purpose:
+                # rows written before the typed limbs existed carry none of them
+                # and must still produce a row rather than be dropped. It is only
+                # reached when the stored row has no ``study_id``.
                 study_id = str(
-                    meta.get("workspace_id")
+                    meta.get("study_id")
+                    or meta.get("workspace_id")
                     or meta.get("paper_id")
                     or meta.get("doi")
                     or meta.get("filename")
@@ -217,6 +283,14 @@ class MatrixExtractor:
                         "title": meta.get("title", ""),
                         "authors": meta.get("authors", ""),
                         "year": meta.get("year", ""),
+                        # The stored study limb, kept distinct from the row
+                        # label above: it is the retrieval scope, and it is what
+                        # spans every document the study owns. Empty on a legacy
+                        # row, which then falls through to the legacy chain.
+                        "scope_study_id": str(meta.get("study_id") or ""),
+                        "document_id": str(meta.get("document_id") or ""),
+                        "workspace_id": str(meta.get("workspace_id") or ""),
+                        "doi": str(meta.get("doi") or ""),
                     }
 
         extracted_rows: list[dict[str, Any]] = []
@@ -227,6 +301,10 @@ class MatrixExtractor:
                 authors=meta["authors"],
                 year=meta["year"],
                 llm_callable=llm_callable,
+                scope_study_id=meta["scope_study_id"] or None,
+                document_id=meta["document_id"] or None,
+                workspace_id=meta["workspace_id"] or None,
+                doi=meta["doi"] or None,
             )
             extracted_rows.append(row)
 
