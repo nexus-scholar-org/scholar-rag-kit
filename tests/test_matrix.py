@@ -164,6 +164,106 @@ def _write_protocol(tmp_path: Path) -> Path:
     return proto_path
 
 
+#: One study that owns two documents. F1 lived exactly here: a study is not a
+#: document, so a row scoped by either one of them silently drops the other's
+#: chunks and makes the cell depend on store iteration order.
+MULTI_DOC_STUDY = "STU-" + "a" * 32
+MULTI_DOCUMENTS = {
+    "DOC-" + "1" * 32: ("# Alpaca\n\n## Methodology\nAlpaca ran on 250 tasks.\n", "a"),
+    "DOC-" + "2" * 32: ("# Badger\n\n## Methodology\nBadger ran on 900 tasks.\n", "b"),
+}
+
+
+def _index_one_study_two_documents(tmp_path: Path, order: list[str]):
+    """Index one study's two documents in ``order`` and extract the matrix."""
+
+    db_path = str(tmp_path / "chroma_db")
+    indexer = ScholarIndexer(db_path=db_path, collection_name=COLLECTION, embedder_kwargs={"provider": PROVIDER})
+    for document_id in order:
+        text, tag = MULTI_DOCUMENTS[document_id]
+        indexer.index_markdown(
+            text,
+            request=_typed_request(
+                study_id=MULTI_DOC_STUDY,
+                document_id=document_id,
+                parent_artifact_id="ART-" + tag * 32,
+                parent_artifact_sha256="sha256:" + tag * 32,
+                extracted_content_sha256="sha256:" + ("1" if tag == "a" else "2") * 32,
+            ),
+        )
+    extractor = MatrixExtractor(
+        protocol=_write_protocol(tmp_path),
+        db_path=db_path,
+        collection_name=COLLECTION,
+        embedder_kwargs={"provider": PROVIDER},
+    )
+    rows, _csv_path, _json_path = extractor.extract_all(output_dir=tmp_path / "literature")
+    return rows, indexer
+
+
+def test_one_study_spanning_two_documents_is_one_row_scoped_by_the_study(tmp_path: Path):
+    """A study owning several documents keeps every document's chunks in scope.
+
+    Row grain stays per-study, and the retrieval scope is the stored study limb --
+    never one of the study's documents. Scoping by ``document_id`` would still
+    emit one row, but it would answer that row's cells from a single document and
+    flip which one with store iteration order, which is a scientific-integrity
+    defect rather than a cosmetic one.
+    """
+
+    first, second = list(MULTI_DOCUMENTS)
+    rows_a, indexer_a = _index_one_study_two_documents(tmp_path / "a", [first, second])
+    rows_b, _indexer_b = _index_one_study_two_documents(tmp_path / "b", [second, first])
+
+    # One study is still exactly one row in both insertion orders.
+    assert len(rows_a) == 1
+    assert len(rows_b) == 1
+    assert rows_a[0]["study_id"] == MULTI_DOC_STUDY
+
+    # The row must not depend on the order the documents were indexed in.
+    assert rows_a == rows_b, "the matrix row changed when only the insertion order changed"
+
+    # The cell is answered from retrieved text, not from the placeholder.
+    cell = str(rows_a[0]["sample_size"])
+    assert cell != "Not Reported"
+
+    # And the scope is provably complete: the stored study limb reaches BOTH of
+    # the study's documents, where either document limb would reach only one.
+    in_scope = indexer_a.collection.get(where={"study_id": MULTI_DOC_STUDY}, include=["metadatas"])
+    assert {str(meta["document_id"]) for meta in in_scope["metadatas"]} == set(MULTI_DOCUMENTS)
+    for document_id in MULTI_DOCUMENTS:
+        alone = indexer_a.collection.get(where={"document_id": document_id}, include=["metadatas"])
+        assert len(alone["metadatas"]) == 1, "fixture must own exactly one chunk per document"
+
+
+def test_matrix_scopes_a_typed_row_by_study_and_never_by_one_of_its_documents(tmp_path: Path):
+    """The row's scope is the study limb even when a document limb is available.
+
+    ``extract_all`` carries both; the study limb must win, because it is the only
+    one that spans the whole study.
+    """
+
+    from scholar_rag.matrix import MatrixExtractor as _MatrixExtractor
+
+    assert _MatrixExtractor._resolve_scope(
+        MULTI_DOC_STUDY,
+        scope_study_id=MULTI_DOC_STUDY,
+        document_id=next(iter(MULTI_DOCUMENTS)),
+        workspace_id=IDENTITY_BLOCK["workspace_id"],
+        doi="10.1000/x",
+    ) == {"study_id": MULTI_DOC_STUDY}
+
+    # A legacy row -- no stored study limb -- still resolves through the chain.
+    assert _MatrixExtractor._resolve_scope("SCI-legacy-01", document_id="DOC-1") == {"document_id": "DOC-1"}
+    assert _MatrixExtractor._resolve_scope("SCI-legacy-01", doi="10.1000/x") == {"doi": "10.1000/x"}
+    assert _MatrixExtractor._resolve_scope("SCI-legacy-01", workspace_id="SCI-legacy-01") == {
+        "workspace_id": "SCI-legacy-01"
+    }
+    # A direct caller that supplies nothing keeps the historical label inference.
+    assert _MatrixExtractor._resolve_scope("10.1000/x") == {"doi": "10.1000/x"}
+    assert _MatrixExtractor._resolve_scope("SCI-000001") == {"workspace_id": "SCI-000001"}
+
+
 def test_two_studies_in_one_workspace_stay_two_matrix_rows(tmp_path: Path):
     """Two studies indexed through the typed request must not collapse into one row.
 

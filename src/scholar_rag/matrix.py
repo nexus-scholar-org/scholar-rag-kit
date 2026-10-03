@@ -105,36 +105,42 @@ class MatrixExtractor:
     def _resolve_scope(
         study_id: str,
         *,
+        scope_study_id: str | None = None,
         document_id: str | None = None,
         workspace_id: str | None = None,
         doi: str | None = None,
-    ) -> dict[str, str | None]:
+    ) -> dict[str, str]:
         """The store filter that scopes one matrix row's retrieval.
 
-        Preference order is the typed document limb, then the DOI, then the
-        workspace: the document is the most precise slice of a study, and the
-        other two are the limbs a legacy row carries.
+        ``scope_study_id`` is the stored study limb and leads, because it is the
+        only limb that spans a whole study: a study may own several documents,
+        and scoping on any one of them would drop the study's other documents
+        from every cell -- and would make the cell depend on which document the
+        store happened to return first.
 
-        When a caller supplies none of them (a direct :meth:`extract_study` call
-        that only knows ``study_id``), the historical inference applies: a key
-        that reads as a DOI filters on ``doi``, anything else on
-        ``workspace_id``. That inference is preserved only for the legacy
-        channel; a typed row always supplies its stored limbs, so no study
-        identity is ever derived from a workspace, a DOI or a filename here.
+        The rest (``document_id``, ``doi``, ``workspace_id``) are the **legacy**
+        chain, reached only for a row that genuinely carries no stored
+        ``study_id``. When a caller supplies none of the four (a direct
+        :meth:`extract_study` call that only knows the row label), the historical
+        inference applies: a label that reads as a DOI filters on ``doi``,
+        anything else on ``workspace_id``.
+
+        The stored study limb is passed as its own argument and never read off
+        the row label, so the legacy label-inference stays wired only to the
+        legacy channel. No study identity is derived from a workspace, a DOI or
+        a filename for a row that has a typed limb.
         """
 
+        if scope_study_id:
+            return {"study_id": scope_study_id}
         if document_id:
-            return {"document_id": document_id, "doi": None, "workspace_id": None}
+            return {"document_id": document_id}
         if doi:
-            return {"document_id": None, "doi": doi, "workspace_id": None}
+            return {"doi": doi}
         if workspace_id:
-            return {"document_id": None, "doi": None, "workspace_id": workspace_id}
+            return {"workspace_id": workspace_id}
         inferred_doi = study_id if ("/" in study_id or "." in study_id) else None
-        return {
-            "document_id": None,
-            "doi": inferred_doi,
-            "workspace_id": None if inferred_doi else study_id,
-        }
+        return {"doi": inferred_doi} if inferred_doi else {"workspace_id": study_id}
 
     def extract_study(
         self,
@@ -144,6 +150,7 @@ class MatrixExtractor:
         year: int | str = "",
         llm_callable: Callable[[str], dict[str, Any]] | None = None,
         *,
+        scope_study_id: str | None = None,
         document_id: str | None = None,
         workspace_id: str | None = None,
         doi: str | None = None,
@@ -151,12 +158,11 @@ class MatrixExtractor:
         """
         Extracts all protocol dimensions for a single study using targeted section retrieval.
 
-        ``document_id``/``workspace_id``/``doi`` are the retrieval scope for this
-        row. They are the limbs the *stored row* actually carries, and they are
-        what the per-cell query is filtered on -- they are never inferred from
-        ``study_id``. ``study_id`` labels the row; it is not a store filter, so a
-        direct caller that supplies no scope keeps the historical workspace/DOI
-        inference (see :meth:`_resolve_scope`).
+        ``study_id`` is the row **label**. It is not a store filter, and the
+        retrieval scope is carried separately by ``scope_study_id`` (the stored
+        study limb) or, for a legacy row, by ``document_id``/``doi``/
+        ``workspace_id``. Passing the label as the scope would re-wire the
+        legacy label-inference onto typed rows. See :meth:`_resolve_scope`.
         """
         record: dict[str, Any] = {
             "study_id": study_id,
@@ -165,7 +171,13 @@ class MatrixExtractor:
             "year": str(year) if year else "",
         }
 
-        scope = self._resolve_scope(study_id, document_id=document_id, workspace_id=workspace_id, doi=doi)
+        scope = self._resolve_scope(
+            study_id,
+            scope_study_id=scope_study_id,
+            document_id=document_id,
+            workspace_id=workspace_id,
+            doi=doi,
+        )
 
         # For each dimension in protocol.matrix_dimensions:
         for dim in self.dimensions:
@@ -175,9 +187,7 @@ class MatrixExtractor:
             relevant_chunks = self.retriever.query(
                 query_text=f"{dim.name} {dim.description}",
                 n_results=3,
-                doi=scope["doi"],
-                workspace_id=scope["workspace_id"],
-                where_filter={"document_id": scope["document_id"]} if scope["document_id"] else None,
+                where_filter=scope,
                 section_category=target_category if target_category else None,
                 log_journal=False,
             )
@@ -188,9 +198,7 @@ class MatrixExtractor:
                 relevant_chunks = self.retriever.query(
                     query_text=f"{dim.name} {dim.description}",
                     n_results=3,
-                    doi=scope["doi"],
-                    workspace_id=scope["workspace_id"],
-                    where_filter={"document_id": scope["document_id"]} if scope["document_id"] else None,
+                    where_filter=scope,
                     section_category=target_category if target_category else None,
                     log_journal=False,
                 )
@@ -275,10 +283,11 @@ class MatrixExtractor:
                         "title": meta.get("title", ""),
                         "authors": meta.get("authors", ""),
                         "year": meta.get("year", ""),
-                        # The stored limbs that scope this row's retrieval. A
-                        # typed row scopes by its own document, so a study's
-                        # cells are answered from that study's own chunks even
-                        # when a sibling study shares its workspace.
+                        # The stored study limb, kept distinct from the row
+                        # label above: it is the retrieval scope, and it is what
+                        # spans every document the study owns. Empty on a legacy
+                        # row, which then falls through to the legacy chain.
+                        "scope_study_id": str(meta.get("study_id") or ""),
                         "document_id": str(meta.get("document_id") or ""),
                         "workspace_id": str(meta.get("workspace_id") or ""),
                         "doi": str(meta.get("doi") or ""),
@@ -292,6 +301,7 @@ class MatrixExtractor:
                 authors=meta["authors"],
                 year=meta["year"],
                 llm_callable=llm_callable,
+                scope_study_id=meta["scope_study_id"] or None,
                 document_id=meta["document_id"] or None,
                 workspace_id=meta["workspace_id"] or None,
                 doi=meta["doi"] or None,
