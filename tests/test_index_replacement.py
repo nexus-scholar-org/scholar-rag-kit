@@ -1942,3 +1942,66 @@ def test_the_chroma_view_refuses_a_switch_it_does_not_implement(chroma_backend):
         field="visibility_switch_mode",
         travels_back=False,
     )
+
+
+# ---------------------------------------------------------------------------
+# ``STORE-HANDOFF`` -- vectors must reach Chroma in a shape Chroma accepts.
+#
+# The view deliberately withholds ``embedding_function`` (R2/R3 own the
+# embedding identity) and therefore owns the coercion at the store boundary.
+# The kit's default provider is sentence-transformers, whose chromadb wrapper
+# returns ``[np.ndarray(float32), ...]``. ``list()`` of such an array yields a
+# list of ``np.float32`` *scalars*, which is none of the four shapes chroma
+# accepts -- so the write fails at commit rather than at the query.
+# ---------------------------------------------------------------------------
+
+
+def numpy_embedder(texts: Sequence[str]) -> list[Any]:
+    """An embedder shaped like the kit's default sentence-transformers provider."""
+
+    numpy = pytest.importorskip("numpy")
+    return [numpy.asarray([float(index + 1) for index in range(DIMENSION)], dtype=numpy.float32) for _ in texts]
+
+
+def test_the_chroma_view_stages_numpy_vectors_from_the_declared_embedder(tmp_path: Path):
+    pytest.importorskip("numpy")
+    pytest.importorskip("chromadb")
+    view = ChromaReplacementView(db_path=tmp_path / "chroma", collection_name=COLLECTION, embedder=numpy_embedder)
+    record = CandidateChunk(
+        chunk_id="CHK-" + "c" * 32,
+        document_id=DOCUMENT,
+        study_id="STU-" + "4" * 32,
+        text="numpy staged text",
+    )
+    run_id = "RUN-" + "9" * 32
+
+    # This is the assertion that matters: chromadb raises
+    # "Expected embeddings to be a list of floats or ints, a list of lists, a
+    # numpy array, or a list of numpy arrays" when it is handed a list of
+    # np.float32 scalars, which is what ``list(vector)`` used to produce.
+    view.stage(run_id, [record])
+
+    staged = view.staged_rows(run_id)
+    assert len(staged) == 1
+    assert staged[0].embedding_dimension == DIMENSION
+    stored = view._collection.get(ids=[view.row_key(run_id, record.chunk_id)], include=["embeddings"])
+    assert len(stored["embeddings"][0]) == DIMENSION
+
+
+def test_the_chroma_view_re_embeds_numpy_vectors_on_declared_identity(tmp_path: Path):
+    pytest.importorskip("chromadb")
+    view = ChromaReplacementView(db_path=tmp_path / "chroma", collection_name=COLLECTION, embedder=numpy_embedder)
+    record = CandidateChunk(
+        chunk_id="CHK-" + "d" * 32,
+        document_id=DOCUMENT,
+        study_id="STU-" + "4" * 32,
+        text="numpy re-embedded text",
+    )
+    run_id = "RUN-" + "8" * 32
+    view.stage(run_id, [record])
+
+    view.embed_staged(run_id, numpy_embedder)
+
+    stored = view._collection.get(ids=[view.row_key(run_id, record.chunk_id)], include=["embeddings"])
+    assert stored["embeddings"][0] is not None
+    assert len(stored["embeddings"][0]) == DIMENSION

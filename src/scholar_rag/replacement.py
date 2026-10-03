@@ -1073,7 +1073,7 @@ class ChromaReplacementView:
                 }
                 for record in records
             ],
-            embeddings=[list(vector) for vector in embeddings],
+            embeddings=_plain_float_vectors(embeddings),
         )
 
     def embed_staged(self, run_id: str, embedder: Callable[[Sequence[str]], Sequence[Sequence[float]]]) -> None:
@@ -1096,7 +1096,7 @@ class ChromaReplacementView:
                 "itself.",
                 field="staged_rows",
             )
-        self._collection.update(ids=ids, embeddings=[list(vector) for vector in embedder(documents)])
+        self._collection.update(ids=ids, embeddings=_plain_float_vectors(embedder(documents)))
 
     def staged_rows(self, run_id: str) -> Sequence[StagedRow]:
         """Report each staged row's stored identity and vector length (R3)."""
@@ -2496,6 +2496,33 @@ def _require_mapping(value: Any, name: str) -> Mapping[str, Any]:
             f"replacement refuses to read {name}: it must be a JSON object, got {type(value).__name__}."
         )
     return value
+
+
+def _plain_float_vector(vector: Any) -> list[float]:
+    """One embedding as the plain Python floats Chroma requires at the store handoff.
+
+    Chroma accepts four shapes for an embedding: a list of floats or ints, a list
+    of lists, a numpy array, or a list of numpy arrays. The view deliberately
+    withholds ``embedding_function`` (R2/R3 own the embedding identity), so it
+    owns this coercion -- and ``list()`` is *not* one. ``list()`` of a numpy
+    array yields a list of numpy **scalars**, which matches none of the four
+    shapes, so a store write fails there with
+    ``Expected embeddings to be a list of floats or ints, ...``.
+
+    The declared embedder is entitled to return numpy: chromadb's own
+    sentence-transformers wrapper returns ``[np.ndarray(float32), ...]``, and that
+    is the kit's default provider. Coercing to plain floats here preserves the
+    vector's values exactly (float32 -> float is lossless) and hands Chroma a
+    shape it accepts.
+    """
+
+    return [float(value) for value in vector]
+
+
+def _plain_float_vectors(embeddings: Any) -> list[list[float]]:
+    """Coerce a sequence of embeddings to plain-float vectors (see :func:`_plain_float_vector`)."""
+
+    return [_plain_float_vector(vector) for vector in embeddings]
 
 
 def _leaf_strings(value: Any, path: tuple[str, ...] = ()) -> Iterable[tuple[str, str]]:

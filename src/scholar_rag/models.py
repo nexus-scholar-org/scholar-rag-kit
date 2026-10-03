@@ -124,6 +124,14 @@ class ChunkMetadata(BaseModel):
 
     chunk_id: str
     workspace_id: str | None = None
+    # The study/document limbs of the canonical identity block (handoff 5.1).
+    # They are carried here so that the values a consumer reads back out of the
+    # store are the ones the chunk id was minted from. They are emitted only
+    # when present: a store written before these limbs existed carries no typed
+    # study, and guessing one from the workspace, DOI or filename would restate
+    # the E3-004 conflation.
+    study_id: str | None = None
+    document_id: str | None = None
     paper_id: str | None = None
     doi: str | None = None
     filename: str = ""
@@ -149,6 +157,12 @@ class ChunkMetadata(BaseModel):
             "paragraph_idx": int(self.paragraph_idx),
             "token_count": int(self.token_count),
         }
+        # Identity first: a consumer that recovers a study from a stored row must
+        # read the typed limb, never the workspace it happened to be indexed in.
+        if self.study_id:
+            meta["study_id"] = str(self.study_id)
+        if self.document_id:
+            meta["document_id"] = str(self.document_id)
         if self.workspace_id:
             meta["workspace_id"] = str(self.workspace_id)
         if self.paper_id:
