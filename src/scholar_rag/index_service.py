@@ -188,6 +188,14 @@ CONFIGURATION_CODE = "CONFIGURATION_INEFFECTIVE"
 #: sidecar code (4.5), reused by import.
 UNUSABLE_TEXT_CODE = "EXTRACTED_TEXT_UNUSABLE"
 
+#: The code recorded for a document whose text does not fingerprint to the
+#: committed ``extracted_content_sha256`` it still claims (C-11, ``E3-NEG-050``).
+#: A frozen sidecar code (4.5), reused by import, like the unusable-text code
+#: beside it: the bytes behind a committed path changed without a re-index
+#: request, so the document is rejected with its code rather than indexed under
+#: a stale content claim.
+CHANGED_BYTES_CODE = "EXTRACTED_CONTENT_CHANGED"
+
 #: The run report's own actions, in the uppercase convention 6.6 fixes.  They are
 #: deliberately **not** ``RAG_INDEX_BUILT`` / ``RAG_INDEX_REJECTED``: those two
 #: belong to the harness acceptance event, and a kit run report that used them
@@ -1102,6 +1110,29 @@ def _build_candidate_manifest(
 
     for source in sorted(request.sources, key=lambda item: str(item.request.document_id)):
         document_id = str(source.request.document_id)
+        if text_fingerprint(source.extracted_text) != str(source.request.extracted_content_sha256):
+            # C-11 / E3-NEG-050: the bytes behind this committed path changed
+            # without a re-index request.  The source still claims the committed
+            # content hash, but its text fingerprints to something else, so
+            # indexing it would mint chunk identities bound to bytes that are no
+            # longer there (G-2).  A per-document rejection with the ledger's
+            # code, exactly like the unusable-text rejection below it: the
+            # stale claim is visible with a code (G-7) and never indexed, while
+            # the healthy documents still publish as PARTIAL (RAG-012).
+            rejected.append(
+                {
+                    "code": CHANGED_BYTES_CODE,
+                    "detail": (
+                        "the extracted text does not fingerprint to the committed extracted_content_sha256, "
+                        "so the bytes at this path changed without a re-index request and the document is "
+                        "refused rather than indexed under a stale content claim"
+                    ),
+                    "document_id": document_id,
+                    "extracted_path": source.extracted_path,
+                    "study_id": str(source.request.study_id),
+                }
+            )
+            continue
         chunks = chunker.chunk(
             markdown_text=source.extracted_text,
             base_metadata=source.request.to_base_metadata(),

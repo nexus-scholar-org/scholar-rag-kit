@@ -1011,6 +1011,140 @@ def test_t90_a_mixed_batch_is_partial_and_never_reads_as_complete(tmp_path: Path
     assert exit_code_for(result) == INDEX_SERVICE_EXIT_CODES["PARTIAL"]
 
 
+def test_t90_neg_035_an_unusable_extraction_is_rejected_with_its_code(tmp_path: Path):
+    """C-13 / E3-NEG-035: empty-after-normalization text is a coded rejection.
+
+    The document's text normalizes to nothing usable, so the chunker mints no
+    chunk for it. It is refused with ``EXTRACTED_TEXT_UNUSABLE`` -- visible in
+    both the typed result and the published sidecar with its code (G-7) --
+    while the healthy document still publishes, so the run is ``PARTIAL`` and
+    never reads as complete.
+    """
+
+    root = t90_workspace_root(tmp_path)
+    result = t90_run(
+        root,
+        sources=(t90_source(T90_DOCUMENT), t90_source(T90_UNUSABLE, text="   ")),
+        parent_view=t90_parent_view(T90_DOCUMENT, T90_UNUSABLE),
+    )
+
+    assert result.outcome == "PARTIAL"
+    assert result.complete is False
+    assert [entry.document_id for entry in result.rejected_documents] == [T90_UNUSABLE]
+    assert [entry.code for entry in result.rejected_documents] == ["EXTRACTED_TEXT_UNUSABLE"]
+    assert result.counts.accepted_documents == 1
+    assert result.sidecar_path is not None
+    sidecar = json.loads((root / result.sidecar_path).read_text(encoding="utf-8"))
+    assert [(entry["document_id"], entry["code"]) for entry in sidecar["rejected_documents"]] == [
+        (T90_UNUSABLE, "EXTRACTED_TEXT_UNUSABLE")
+    ]
+    assert T90_UNUSABLE not in [document["document_id"] for document in sidecar["documents"]]
+    assert all(chunk["document_id"] != T90_UNUSABLE for chunk in sidecar["visible_chunks"])
+
+
+# -- C-11 / E3-NEG-050: changed extracted bytes at an unchanged committed path --
+#
+# The ledger row demands ``EXTRACTED_CONTENT_CHANGED`` when the bytes behind a
+# committed path change without a re-index request. The setup below is that row
+# exactly: the accepted parent committed ``extracted_content_sha256`` for the
+# path, the source still claims that committed hash, but the text it carries
+# fingerprints to something else. Indexing the new text under the stale claim
+# would mint chunk identities bound to bytes that are no longer there (G-2) and
+# report a success the lineage cannot support (G-7).
+
+#: A document whose committed bytes are ``T90_TEXT`` but whose text changed.
+T90_STALE_ID = "DOC-" + "7" * 32
+
+#: Structural text, long enough to chunk, distinct from ``T90_TEXT``.
+T90_CHANGED_TEXT = "\n".join(
+    [
+        "---",
+        "title: a revised study",
+        "---",
+        "",
+        "# Methods",
+        "",
+        "The revised methods are described here. " * 12,
+        "",
+        "## Detail",
+        "",
+        "Further revised detail is reported here. " * 12,
+    ]
+)
+
+
+def t90_stale_source(document_id: str = T90_STALE_ID) -> IndexedSource:
+    """A source claiming the committed hash while carrying different text.
+
+    The request carries ``t90_fingerprint(T90_TEXT)`` -- the hash the accepted
+    parent committed for this path -- but the extracted text is
+    ``T90_CHANGED_TEXT``. That disagreement is the whole C-11 condition, stated
+    with no other fault mixed in.
+    """
+
+    return IndexedSource(
+        request=IndexDocumentRequest(
+            workspace_id=T90_WORKSPACE,
+            study_id=T90_STUDY,
+            document_id=document_id,
+            parent_artifact_id=T90_PARENT_VIEW["artifact_id"],
+            parent_artifact_sha256=T90_PARENT_SHA,
+            extracted_content_sha256=t90_fingerprint(T90_TEXT),
+            backend_provider="test-provider",
+            backend_model="test-embedder-v1",
+            collection=T90_COLLECTION,
+            run_id=T90_RUN,
+        ),
+        extracted_text=T90_CHANGED_TEXT,
+        extracted_path=f"extracted/{document_id}.md",
+        extraction_method="DETERMINISTIC_RULE",
+    )
+
+
+def test_t90_neg_050_changed_bytes_at_a_committed_path_are_rejected_not_indexed(tmp_path: Path):
+    """C-11 / E3-NEG-050: changed bytes are refused with their code, never absorbed."""
+
+    root = t90_workspace_root(tmp_path)
+    result = t90_run(
+        root,
+        sources=(t90_source(T90_DOCUMENT), t90_stale_source()),
+        parent_view=t90_parent_view(T90_DOCUMENT, T90_STALE_ID),
+    )
+
+    assert result.outcome == "PARTIAL", "one stale document beside a healthy one is a mixed batch, not a success"
+    assert result.complete is False
+    assert [entry.document_id for entry in result.rejected_documents] == [T90_STALE_ID]
+    assert [entry.code for entry in result.rejected_documents] == ["EXTRACTED_CONTENT_CHANGED"]
+    assert result.counts.rejected_documents == 1
+    assert result.counts.accepted_documents == 1
+    assert result.sidecar_path is not None, "the healthy document is still published; only the stale claim is refused"
+    sidecar = json.loads((root / result.sidecar_path).read_text(encoding="utf-8"))
+    assert [entry["document_id"] for entry in sidecar["rejected_documents"]] == [T90_STALE_ID]
+    assert T90_STALE_ID not in [document["document_id"] for document in sidecar["documents"]]
+    assert all(chunk["document_id"] != T90_STALE_ID for chunk in sidecar["visible_chunks"]), (
+        "no chunk of the changed bytes may be visible under the stale content claim"
+    )
+
+
+def test_t90_neg_050_the_cli_reports_changed_bytes_at_a_committed_path(tmp_path: Path, offline_embedder):
+    """C-11 / E3-NEG-050 end to end: the file changed after the parent accepted it."""
+
+    root, view_path = t90_cli_workspace(tmp_path, documents=(T90_DOCUMENT, T90_STALE_ID))
+    # The bytes change after acceptance; the committed hash in parent-view.json
+    # is now stale for exactly this path.
+    (root / f"extracted/{T90_STALE_ID}.md").write_text(T90_CHANGED_TEXT, encoding="utf-8")
+
+    outcome = CliRunner().invoke(app, t90_cli_args(root, view_path))
+
+    assert outcome.exit_code == INDEX_SERVICE_EXIT_CODES["PARTIAL"]
+    envelope = json.loads(outcome.output)
+    assert envelope["outcome"] == "PARTIAL"
+    assert envelope["complete"] is False
+    rejected = {entry["document_id"]: entry["code"] for entry in envelope["rejected_documents"]}
+    assert rejected.get(T90_STALE_ID) == "EXTRACTED_CONTENT_CHANGED"
+    assert envelope["counts"]["accepted_documents"] == 1
+
+
 def test_t90_an_unconstructible_request_never_becomes_a_success(tmp_path: Path):
     """A bad commit is caught at construction -- and still typed, never a traceback."""
 
@@ -1427,6 +1561,48 @@ def test_t90_the_cli_refuses_an_absolute_extracted_reference(tmp_path: Path, off
 
     assert outcome.exit_code == INDEX_SERVICE_EXIT_CODES["REFUSED"]
     assert "Traceback" not in outcome.output
+
+
+@pytest.mark.parametrize(
+    ("bad_path", "description"),
+    [
+        ("C:/elsewhere/x.md", "a drive-absolute reference"),
+        ("../escape/x.md", "a leading traversal out of the workspace"),
+    ],
+)
+def test_t90_neg_021_a_path_shaped_escape_is_refused_before_any_backend_write(
+    tmp_path: Path, offline_embedder, bad_path: str, description: str
+):
+    """C-12 / E3-NEG-021: a path-shaped escape never reaches the filesystem.
+
+    The accepted parent names an ``extracted_path`` that is not a
+    workspace-relative reference. Binding refuses it on its shape -- before a
+    single file is read and before the store is even opened -- so the run is
+    ``REFUSED`` with zero counts, no sidecar, and no backend directory.
+
+    No code is asserted here on purpose. The kit reports this caller-shaped
+    fault through its own typed refusal; the ledger's ``PATH_OUTSIDE_WORKSPACE``
+    is the gate-level code the harness acceptance adapter (T-130) owns. That
+    mapping is recorded as open finding T133-OF-01 rather than legislated by
+    this test.
+    """
+
+    root, view_path = t90_cli_workspace(tmp_path)
+    view = json.loads(view_path.read_text(encoding="utf-8"))
+    view["documents"][0]["extracted_path"] = bad_path
+    view_path.write_text(json.dumps(view), encoding="utf-8")
+
+    outcome = CliRunner().invoke(app, t90_cli_args(root, view_path))
+
+    assert outcome.exit_code == INDEX_SERVICE_EXIT_CODES["REFUSED"], description
+    assert "Traceback" not in outcome.output
+    envelope = json.loads(outcome.output)
+    assert envelope["outcome"] == "REFUSED"
+    assert envelope["complete"] is False
+    assert envelope["sidecar_path"] is None
+    assert envelope["counts"] == {"accepted_documents": 0, "rejected_documents": 0, "visible_chunks": 0}
+    assert not (root / "rag").exists(), "no sidecar subtree was started for a refused bind"
+    assert not (root / "chroma").exists(), "the store was never opened for a refused bind"
 
 
 # -- the run report: a kit-owned event, never the acceptance event -----------
@@ -1952,6 +2128,95 @@ def test_t90_a_parent_view_without_its_documents_is_refused():
         t90_request(Path("."), parent_view=dict(T90_PARENT_VIEW))
 
 
+#: A document id the accepted parent never admitted.
+T90_GHOST_ID = "DOC-" + "8" * 32
+
+#: A study id the accepted parent never bound this document to.
+T90_STRANGER_STUDY = "STU-" + "8" * 32
+
+
+def test_t90_neg_009_a_document_absent_from_the_accepted_parent_is_refused(tmp_path: Path):
+    """C-09 / E3-NEG-009 (handoff 6.2 check 4): the eligibility join is exact.
+
+    The run offers a document the accepted parent never admitted. The manifest
+    agreement check refuses it with ``VALIDATION_ERROR`` and the run publishes
+    nothing: zero counts, no sidecar, no live-set claim, and the previously
+    accepted index untouched (the store pointer never moves).
+    """
+
+    root = t90_workspace_root(tmp_path)
+    store = T90Store()
+    result = index_workspace(
+        t90_request(
+            root,
+            sources=(t90_source(T90_DOCUMENT), t90_source(T90_GHOST_ID)),
+            parent_view=t90_parent_view(T90_DOCUMENT),
+        ),
+        backend=store,
+        reader=store,
+        embedder=t90_embedder,
+        workspace_root=root,
+    )
+
+    assert result.outcome == "REFUSED"
+    assert result.complete is False
+    assert result.codes == ("VALIDATION_ERROR",)
+    assert result.counts == Counts(accepted_documents=0, rejected_documents=0, visible_chunks=0)
+    assert result.sidecar_path is None, "a refused run writes no sidecar"
+    assert result.live_set_matches is False
+    assert result.journaled is True, "a refusal is still recorded -- it is 6.6's second action"
+    assert store.pointer == frozenset(), "no backend mutation happened before the refusal"
+    events = t90_events(root)
+    assert len(events) == 1
+    assert events[0]["action"] == ACTION_RUN_REJECTED
+
+
+def test_t90_neg_011_a_study_absent_from_the_accepted_lineage_is_refused(tmp_path: Path):
+    """C-10 / E3-NEG-011 (handoff 6.2 check 4): study identity is inherited byte for byte.
+
+    The document is admitted by the parent, but the run binds it to a study the
+    parent never bound it to -- a study absent from the accepted lineage for
+    this document. The byte-identity check refuses it with
+    ``VALIDATION_ERROR`` and the run publishes nothing.
+    """
+
+    root = t90_workspace_root(tmp_path)
+    store = T90Store()
+    stranger = IndexedSource(
+        request=IndexDocumentRequest(
+            workspace_id=T90_WORKSPACE,
+            study_id=T90_STRANGER_STUDY,
+            document_id=T90_DOCUMENT,
+            parent_artifact_id=T90_PARENT_VIEW["artifact_id"],
+            parent_artifact_sha256=T90_PARENT_SHA,
+            extracted_content_sha256=t90_fingerprint(T90_TEXT),
+            backend_provider="test-provider",
+            backend_model="test-embedder-v1",
+            collection=T90_COLLECTION,
+            run_id=T90_RUN,
+        ),
+        extracted_text=T90_TEXT,
+        extracted_path=f"extracted/{T90_DOCUMENT}.md",
+        extraction_method="DETERMINISTIC_RULE",
+    )
+    result = index_workspace(
+        t90_request(root, sources=(stranger,), parent_view=t90_parent_view(T90_DOCUMENT)),
+        backend=store,
+        reader=store,
+        embedder=t90_embedder,
+        workspace_root=root,
+    )
+
+    assert result.outcome == "REFUSED"
+    assert result.complete is False
+    assert result.codes == ("VALIDATION_ERROR",)
+    assert result.counts == Counts(accepted_documents=0, rejected_documents=0, visible_chunks=0)
+    assert result.sidecar_path is None, "a refused run writes no sidecar"
+    assert result.live_set_matches is False
+    assert result.journaled is True, "a refusal is still recorded -- it is 6.6's second action"
+    assert store.pointer == frozenset(), "no backend mutation happened before the refusal"
+
+
 def test_t90_one_run_indexes_one_document_once():
     with pytest.raises(IndexServiceValidationError):
         t90_request(Path("."), sources=(t90_source(T90_DOCUMENT), t90_source(T90_DOCUMENT)))
@@ -2311,6 +2576,33 @@ def test_t90_a_docs_path_covering_only_some_parent_documents_is_refused(tmp_path
     assert "workspace root" not in reasoning, "docs_path is not the workspace root; do not send the caller there"
     assert "1 document(s)" in reasoning, "the reason must count the documents that fell outside"
     assert "position(s) 1" in reasoning, "the reason must locate the offending record in the parent view"
+
+
+def test_t90_neg_022_a_parent_document_outside_the_docs_scope_is_refused(tmp_path: Path):
+    """C-12 / E3-NEG-022: every parent document must resolve inside ``docs_path``.
+
+    The documents directory names none of the accepted parent's documents, so
+    it is not the directory this run was told to index. The run is ``REFUSED``
+    before anything is read or written: zero counts, no sidecar, and no event
+    at all (a preflight refusal reports no run, not even a rejected one).
+
+    No code is asserted here on purpose -- see ``test_t90_neg_021`` for why:
+    the ledger's ``PATH_OUTSIDE_WORKSPACE`` is the gate-level code owned by the
+    harness acceptance adapter (open finding T133-OF-01).
+    """
+
+    root = t90_workspace_root(tmp_path)
+    (root / "elsewhere").mkdir()
+
+    result = t90_run(root, docs_path="elsewhere")
+
+    assert result.outcome == "REFUSED", "a docs directory outside the parent's documents decides nothing"
+    assert result.complete is False
+    assert result.counts == Counts(accepted_documents=0, rejected_documents=0, visible_chunks=0)
+    assert result.sidecar_path is None, "nothing was indexed from a mis-scoped request"
+    assert result.journaled is False, "a preflight refusal reports no run event"
+    assert t90_events(root) == []
+    assert not (root / "rag").exists(), "no sidecar subtree was started for a mis-scoped request"
 
 
 def test_t90_a_docs_path_reasoning_names_every_offset_it_counted(tmp_path: Path):

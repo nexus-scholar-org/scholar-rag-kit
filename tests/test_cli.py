@@ -8,6 +8,7 @@ import pytest
 from typer.testing import CliRunner
 
 import scholar_rag.cli as cli_module
+from scholar_rag.chunker import text_fingerprint
 from scholar_rag.cli import app
 
 runner = CliRunner()
@@ -275,9 +276,11 @@ def _admitted_workspace(tmp_path, name="ws"):
     root = tmp_path / name
     (root / "extracted").mkdir(parents=True, exist_ok=True)
     document_id = "DOC-" + "9" * 32
-    (root / "extracted" / f"{document_id}.md").write_text(
-        "# Introduction\n\nAn admitted claim, present on disk.\n", encoding="utf-8"
-    )
+    # The committed hash is the fingerprint of the bytes on disk: since C-11 /
+    # E3-NEG-050 a record hash that the file bytes do not fingerprint to is a
+    # changed-bytes refusal, so this fixture states the true one.
+    admitted_text = "# Introduction\n\nAn admitted claim, present on disk.\n"
+    (root / "extracted" / f"{document_id}.md").write_text(admitted_text, encoding="utf-8")
     view = {
         "artifact_id": "ART-" + "2" * 32,
         "artifact_type": "document_manifest",
@@ -290,7 +293,7 @@ def _admitted_workspace(tmp_path, name="ws"):
                 "document_id": document_id,
                 "study_id": "STU-" + "4" * 32,
                 "extracted_path": f"extracted/{document_id}.md",
-                "extracted_content_sha256": "sha256:" + "8" * 64,
+                "extracted_content_sha256": text_fingerprint(admitted_text),
                 "extraction_method": "DETERMINISTIC_RULE",
             }
         ],

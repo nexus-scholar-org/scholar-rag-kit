@@ -719,6 +719,65 @@ def test_neg_019_a_chunk_id_repeated_inside_one_document_is_refused():
     )
 
 
+def test_neg_030_a_chunk_id_reused_within_one_study_is_refused():
+    """C-27 / E3-NEG-030: chunk identity is unique within a study.
+
+    Two documents bound to the *same* study claim one chunk id. The
+    collection-global duplicate of ``E3-NEG-019`` would fire for any second
+    claimant; this pins the study-scope half of C-27: even inside one study a
+    repeated id is a ``CHUNK_IDENTITY_COLLISION``, never a shared unit of
+    evidence.
+    """
+
+    mutated = golden()
+    sibling = {
+        "chunk_ids": [BASELINE_CHUNK_ID],
+        "detail": None,
+        "document_id": "DOC-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "extracted_content_sha256": "sha256:" + "7a" * 32,
+        "extracted_path": "extracted/DOC-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA.md",
+        "extraction_method": "DETERMINISTIC_RULE",
+        # The same study DOC_3333 was bound to: the collision is within it.
+        "study_id": "STU-44444444444444444444444444444444",
+        "status": "INDEXED",
+    }
+    mutated["documents"] = [*mutated["documents"], sibling]
+    mutated["counts"]["accepted_documents"] = len(mutated["documents"])
+    mutated = reseal(mutated)
+    refuse(
+        lambda: IndexManifest.from_payload(mutated),
+        ChunkIdentityCollisionError,
+        "CHUNK_IDENTITY_COLLISION",
+        field="documents.2.chunk_ids",
+        mentions=(BASELINE_CHUNK_ID, "twice"),
+    )
+
+
+def test_neg_031_a_chunk_id_reused_across_studies_is_refused():
+    """C-27 / E3-NEG-031: chunk identity is globally unique in the collection.
+
+    ``DOC_6666`` (study ``STU-7777...``) claims a chunk id minted for
+    ``DOC_3333`` (study ``STU-4444...``). Same mechanism as ``E3-NEG-019``;
+    this pins the collection-global scope half of C-27 under its own ledger
+    id, so the two scope halves cannot be merged away unnoticed.
+    """
+
+    mutated = golden()
+    document_of(mutated, DOC_6666)["chunk_ids"] = [BASELINE_CHUNK_ID]
+    mutated["visible_chunks"] = [
+        chunk for chunk in mutated["visible_chunks"] if chunk["chunk_id"] != "CHK-4d2120ace9cbf53314aa2878a2ddc3a2"
+    ]
+    mutated["counts"]["visible_chunks"] = len(mutated["visible_chunks"])
+    mutated = reseal(mutated)
+    refuse(
+        lambda: IndexManifest.from_payload(mutated),
+        ChunkIdentityCollisionError,
+        "CHUNK_IDENTITY_COLLISION",
+        field="documents.1.chunk_ids",
+        mentions=(BASELINE_CHUNK_ID, "twice"),
+    )
+
+
 def test_the_same_chunk_id_twice_in_the_visible_inventory_is_refused():
     mutated = golden()
     mutated["visible_chunks"] = [*mutated["visible_chunks"], deepcopy(mutated["visible_chunks"][0])]
@@ -1886,6 +1945,26 @@ def test_a_parent_disagreement_carries_the_code_its_failure_class_names(
         code,
         field=field,
         mentions=mentions,
+    )
+
+
+def test_neg_017_a_hash_stale_parent_is_refused_with_parent_hash_mismatch():
+    """C-06 / E3-NEG-017 (handoff 6.2 check 2): content changed after registration.
+
+    The sidecar was sealed against one registered parent hash; the accepted
+    parent now registers another. Every chunk identity derives from that hash,
+    so a hash-stale parent re-mints every identity and the manifest is refused
+    with ``PARENT_HASH_MISMATCH`` rather than re-anchored onto the new lineage.
+    """
+
+    model = IndexManifest.from_payload(golden())
+    view = build_parent_view(model, documents=parent_documents(), sha256="sha256:" + "2" * 64)
+    refuse(
+        lambda: model.check_parent_agreement(view),
+        ParentAgreementError,
+        "PARENT_HASH_MISMATCH",
+        field="parent_artifact_ref.sha256",
+        mentions=("hash-stale parent",),
     )
 
 
