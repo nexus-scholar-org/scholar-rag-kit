@@ -1578,13 +1578,8 @@ def test_t90_neg_021_a_path_shaped_escape_is_refused_before_any_backend_write(
     The accepted parent names an ``extracted_path`` that is not a
     workspace-relative reference. Binding refuses it on its shape -- before a
     single file is read and before the store is even opened -- so the run is
-    ``REFUSED`` with zero counts, no sidecar, and no backend directory.
-
-    No code is asserted here on purpose. The kit reports this caller-shaped
-    fault through its own typed refusal; the ledger's ``PATH_OUTSIDE_WORKSPACE``
-    is the gate-level code the harness acceptance adapter (T-130) owns. That
-    mapping is recorded as open finding T133-OF-01 rather than legislated by
-    this test.
+    ``REFUSED`` with the ledger's ``PATH_OUTSIDE_WORKSPACE``, zero counts, no
+    sidecar, and no backend directory.
     """
 
     root, view_path = t90_cli_workspace(tmp_path)
@@ -1598,6 +1593,7 @@ def test_t90_neg_021_a_path_shaped_escape_is_refused_before_any_backend_write(
     assert "Traceback" not in outcome.output
     envelope = json.loads(outcome.output)
     assert envelope["outcome"] == "REFUSED"
+    assert envelope["codes"] == ["PATH_OUTSIDE_WORKSPACE"]
     assert envelope["complete"] is False
     assert envelope["sidecar_path"] is None
     assert envelope["counts"] == {"accepted_documents": 0, "rejected_documents": 0, "visible_chunks": 0}
@@ -2490,7 +2486,7 @@ def test_t90_a_docs_path_that_covers_no_parent_document_is_refused(tmp_path: Pat
     result = t90_run(root, docs_path="elsewhere")
 
     assert result.outcome == "REFUSED", "a docs directory outside the parent's documents decides nothing"
-    assert result.codes == ("VALIDATION_ERROR",)
+    assert result.codes == ("PATH_OUTSIDE_WORKSPACE",)
     assert result.journaled is False
     assert t90_events(root) == []
 
@@ -2554,7 +2550,7 @@ def test_t90_a_docs_path_covering_only_some_parent_documents_is_refused(tmp_path
     )
 
     assert result.outcome == "REFUSED", "one of two parent documents is outside the stated docs directory"
-    assert result.codes == ("VALIDATION_ERROR",)
+    assert result.codes == ("PATH_OUTSIDE_WORKSPACE",)
     assert result.sidecar_path is None, "nothing was indexed from a mis-scoped request"
     assert result.journaled is False
     assert t90_events(root) == [], "API and CLI both refuse before a run exists"
@@ -2569,6 +2565,7 @@ def test_t90_a_docs_path_covering_only_some_parent_documents_is_refused(tmp_path
             workspace_root=root,
         )
     reasoning = str(raised.value)
+    assert raised.value.code == "PATH_OUTSIDE_WORKSPACE"
     assert raised.value.field == "docs_path", "the refusal names the option that was misconfigured"
     # The knob, not the workspace root: a documents directory that covers only some
     # of the parent is a wrong ``docs_path``, and the workspace root is fine.
@@ -2583,12 +2580,9 @@ def test_t90_neg_022_a_parent_document_outside_the_docs_scope_is_refused(tmp_pat
 
     The documents directory names none of the accepted parent's documents, so
     it is not the directory this run was told to index. The run is ``REFUSED``
-    before anything is read or written: zero counts, no sidecar, and no event
-    at all (a preflight refusal reports no run, not even a rejected one).
-
-    No code is asserted here on purpose -- see ``test_t90_neg_021`` for why:
-    the ledger's ``PATH_OUTSIDE_WORKSPACE`` is the gate-level code owned by the
-    harness acceptance adapter (open finding T133-OF-01).
+    with the ledger's ``PATH_OUTSIDE_WORKSPACE`` before anything is read or
+    written: zero counts, no sidecar, and no event at all (a preflight refusal
+    reports no run, not even a rejected one).
     """
 
     root = t90_workspace_root(tmp_path)
@@ -2597,6 +2591,7 @@ def test_t90_neg_022_a_parent_document_outside_the_docs_scope_is_refused(tmp_pat
     result = t90_run(root, docs_path="elsewhere")
 
     assert result.outcome == "REFUSED", "a docs directory outside the parent's documents decides nothing"
+    assert result.codes == ("PATH_OUTSIDE_WORKSPACE",)
     assert result.complete is False
     assert result.counts == Counts(accepted_documents=0, rejected_documents=0, visible_chunks=0)
     assert result.sidecar_path is None, "nothing was indexed from a mis-scoped request"
@@ -2655,7 +2650,7 @@ def test_t90_a_docs_path_reasoning_names_every_offset_it_counted(tmp_path: Path)
     )
 
     assert result.outcome == "REFUSED", "two of four parent documents are outside the stated docs directory"
-    assert result.codes == ("VALIDATION_ERROR",)
+    assert result.codes == ("PATH_OUTSIDE_WORKSPACE",)
     assert result.sidecar_path is None, "nothing was indexed from a mis-scoped request"
 
     with pytest.raises(IndexServiceValidationError) as raised:
@@ -2663,6 +2658,7 @@ def test_t90_a_docs_path_reasoning_names_every_offset_it_counted(tmp_path: Path)
             records, docs_path=(root / "scoped").resolve(), workspace_root=root
         )
     reasoning = str(raised.value)
+    assert raised.value.code == "PATH_OUTSIDE_WORKSPACE"
     assert "docs_path" in reasoning, "the reason must name docs_path, the option actually misconfigured"
     assert "workspace root" not in reasoning, "docs_path is not the workspace root; do not send the caller there"
     assert "2 document(s)" in reasoning, "the count must be the real number of offenders, not the first one"
