@@ -1255,6 +1255,41 @@ def test_the_query_never_reports_a_similarity_or_an_entailment() -> None:
     assert healthy.codes == (), "an equality over identities needs no score to report"
 
 
+def _t133d_protocol_members(cls: type) -> set[str]:
+    """Version-robust protocol members (T-133d env hardening, no product change).
+
+    ``typing.Protocol.__protocol_attrs__`` exists on 3.12+ and is absent on 3.11;
+    ``typing.get_protocol_members`` exists only on 3.12+. Fall back to the
+    protocol's own ``__dict__`` plus ``__annotations__``, excluding private
+    machinery. Proves the same set on both versions.
+    """
+
+    attrs = getattr(cls, "__protocol_attrs__", None)
+    if attrs is not None:
+        return set(attrs)
+    import typing as _typing
+
+    get_members = getattr(_typing, "get_protocol_members", None)
+    if callable(get_members):
+        try:
+            return set(get_members(cls))
+        except Exception:  # noqa: BLE001 - fall through to the introspection fallback
+            pass
+    members: set[str] = set()
+    for base in getattr(cls, "__mro__", (cls,)):
+        if getattr(base, "__module__", "") == "typing" and getattr(base, "__name__", "") in ("Protocol", "Generic"):
+            continue
+        if base is object:
+            continue
+        for name in getattr(base, "__dict__", {}):
+            if not name.startswith("_"):
+                members.add(name)
+        for name in getattr(base, "__annotations__", {}):
+            if not name.startswith("_"):
+                members.add(name)
+    return members
+
+
 def test_the_module_exposes_no_write_surface_and_takes_no_embedder() -> None:
     """Check 6 is a read, and the module is built so it cannot become a write.
 
@@ -1265,7 +1300,7 @@ def test_the_module_exposes_no_write_surface_and_takes_no_embedder() -> None:
 
     import scholar_rag.index_verifier as module
 
-    assert set(VerifiableBackend.__protocol_attrs__) == set(READER_OPERATIONS)
+    assert _t133d_protocol_members(VerifiableBackend) == set(READER_OPERATIONS)
     for name in ("stage", "switch_visibility", "remove_obsolete", "add", "update", "delete", "modify", "upsert"):
         assert not hasattr(module.ChromaVisibleSetReader, name), f"the reader must not offer {name}"
 

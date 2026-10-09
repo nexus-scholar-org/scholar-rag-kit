@@ -8,6 +8,7 @@ import pytest
 from typer.testing import CliRunner
 
 import scholar_rag.cli as cli_module
+from scholar_rag.chunker import text_fingerprint
 from scholar_rag.cli import app
 
 runner = CliRunner()
@@ -275,9 +276,11 @@ def _admitted_workspace(tmp_path, name="ws"):
     root = tmp_path / name
     (root / "extracted").mkdir(parents=True, exist_ok=True)
     document_id = "DOC-" + "9" * 32
-    (root / "extracted" / f"{document_id}.md").write_text(
-        "# Introduction\n\nAn admitted claim, present on disk.\n", encoding="utf-8"
-    )
+    # The committed hash is the fingerprint of the bytes on disk: since C-11 /
+    # E3-NEG-050 a record hash that the file bytes do not fingerprint to is a
+    # changed-bytes refusal, so this fixture states the true one.
+    admitted_text = "# Introduction\n\nAn admitted claim, present on disk.\n"
+    (root / "extracted" / f"{document_id}.md").write_text(admitted_text, encoding="utf-8")
     view = {
         "artifact_id": "ART-" + "2" * 32,
         "artifact_type": "document_manifest",
@@ -290,7 +293,7 @@ def _admitted_workspace(tmp_path, name="ws"):
                 "document_id": document_id,
                 "study_id": "STU-" + "4" * 32,
                 "extracted_path": f"extracted/{document_id}.md",
-                "extracted_content_sha256": "sha256:" + "8" * 64,
+                "extracted_content_sha256": text_fingerprint(admitted_text),
                 "extraction_method": "DETERMINISTIC_RULE",
             }
         ],
@@ -427,7 +430,7 @@ def test_cli_partial_docs_path_reasoning_names_docs_path_count_and_offsets(tmp_p
     text = " ".join(_plain(human.output).split())
 
     assert human.exit_code == 2, "a documents directory covering only some of the parent is refused"
-    assert "REFUSED" in text and "VALIDATION_ERROR" in text
+    assert "REFUSED" in text and "PATH_OUTSIDE_WORKSPACE" in text
     assert "docs_path" in text, "the operator is told which option to turn"
     assert "workspace root" not in text, "docs_path is not the workspace root"
     assert "2 document(s)" in text, "the count is the real number of offenders"
@@ -442,7 +445,7 @@ def test_cli_partial_docs_path_reasoning_names_docs_path_count_and_offsets(tmp_p
     assert as_json.exit_code == 2
     envelope = json.loads(_plain(as_json.output))
     assert envelope["outcome"] == "REFUSED", "the machine surface carries the same verdict"
-    assert "VALIDATION_ERROR" in envelope["codes"]
+    assert envelope["codes"] == ["PATH_OUTSIDE_WORKSPACE"]
     assert envelope["counts"] == {"accepted_documents": 0, "rejected_documents": 0, "visible_chunks": 0}
     assert envelope["journaled"] is False
 

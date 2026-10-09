@@ -1243,6 +1243,42 @@ def test_e3_pos_011_legacy_a_real_chroma_legacy_store_is_detected_and_left_untou
 # ---------------------------------------------------------------------------
 
 
+def _t133d_protocol_members(cls: type) -> set[str]:
+    """Version-robust protocol members (T-133d env hardening, no product change).
+
+    ``typing.Protocol.__protocol_attrs__`` exists on 3.12+ and is absent on 3.11;
+    ``typing.get_protocol_members`` exists only on 3.12+. Fall back to the
+    protocol's own ``__dict__`` plus ``__annotations__`` (data members like
+    ``mode`` live only in annotations), excluding private machinery. Proves the
+    same set on both versions.
+    """
+
+    attrs = getattr(cls, "__protocol_attrs__", None)
+    if attrs is not None:
+        return set(attrs)
+    import typing as _typing
+
+    get_members = getattr(_typing, "get_protocol_members", None)
+    if callable(get_members):
+        try:
+            return set(get_members(cls))
+        except Exception:  # noqa: BLE001 - fall through to the introspection fallback
+            pass
+    members: set[str] = set()
+    for base in getattr(cls, "__mro__", (cls,)):
+        if getattr(base, "__module__", "") == "typing" and getattr(base, "__name__", "") in ("Protocol", "Generic"):
+            continue
+        if base is object:
+            continue
+        for name in getattr(base, "__dict__", {}):
+            if not name.startswith("_"):
+                members.add(name)
+        for name in getattr(base, "__annotations__", {}):
+            if not name.startswith("_"):
+                members.add(name)
+    return members
+
+
 def test_e3_neg_045_no_argument_or_attribute_disables_legacy_detection() -> None:
     """7.6 limb 1: there is no configuration that turns detection off.
 
@@ -1260,7 +1296,7 @@ def test_e3_neg_045_no_argument_or_attribute_disables_legacy_detection() -> None
             assert parameter.default in (inspect.Parameter.empty, None) or name in {"storage_schema_version", "request"}
 
     assert not [name for name in dir(LegacyMigrator) if any(word in name.lower() for word in banned)]
-    assert set(LegacyStoreReader.__protocol_attrs__) == {"read_rows", "read_store_metadata"}, (
+    assert _t133d_protocol_members(LegacyStoreReader) == {"read_rows", "read_store_metadata"}, (
         "the reader protocol must be read-only"
     )
 
@@ -1540,7 +1576,7 @@ def test_the_recovery_backend_protocol_is_the_frozen_one() -> None:
     from scholar_rag.recovery import RecoveryBackend
 
     assert RecoveryBackend.__name__ == "ReplacementBackend"
-    assert set(RecoveryBackend.__protocol_attrs__) == set(
+    assert _t133d_protocol_members(RecoveryBackend) == set(
         [
             "mode",
             "stage",

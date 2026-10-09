@@ -28,9 +28,9 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Lint with ruff
-        run: uv run ruff check src/ tests/
+        run: uv run --extra dev ruff check src/ tests/
         working-directory: .
 
       - name: Run test suite
-        run: uv run pytest -v tests/
+        run: uv run --extra dev pytest -v tests/
         working-directory: .

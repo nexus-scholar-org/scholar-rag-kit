@@ -188,6 +188,20 @@ CONFIGURATION_CODE = "CONFIGURATION_INEFFECTIVE"
 #: sidecar code (4.5), reused by import.
 UNUSABLE_TEXT_CODE = "EXTRACTED_TEXT_UNUSABLE"
 
+#: The code recorded for a document whose text does not fingerprint to the
+#: committed ``extracted_content_sha256`` it still claims (C-11, ``E3-NEG-050``).
+#: A frozen sidecar code (4.5), reused by import, like the unusable-text code
+#: beside it: the bytes behind a committed path changed without a re-index
+#: request, so the document is rejected with its code rather than indexed under
+#: a stale content claim.
+CHANGED_BYTES_CODE = "EXTRACTED_CONTENT_CHANGED"
+
+#: The code C-12 assigns to a path escape, drive-letter or symlink escape
+#: (``E3-NEG-021``/``E3-NEG-022``).  A frozen ``ErrorCode`` (4.5), reused by
+#: name, like the dependency code above it: a reference that would leave the
+#: workspace is refused with its code rather than honoured.
+PATH_OUTSIDE_WORKSPACE_CODE = "PATH_OUTSIDE_WORKSPACE"
+
 #: The run report's own actions, in the uppercase convention 6.6 fixes.  They are
 #: deliberately **not** ``RAG_INDEX_BUILT`` / ``RAG_INDEX_REJECTED``: those two
 #: belong to the harness acceptance event, and a kit run report that used them
@@ -335,6 +349,22 @@ class StoreDependencyError(IndexServiceError):
     """
 
     code = DEPENDENCY_CODE
+
+
+class PathOutsideWorkspaceError(IndexServicePreflightError):
+    """A path-shaped or containment escape: absolute, traversal, or resolved outside.
+
+    **C-12** / **E3-NEG-021** / **E3-NEG-022** in code form.  A reference that
+    would leave the workspace -- an absolute or drive-relative shape, a ``..``
+    segment, or a resolved path outside its scope including through a link --
+    is the caller's own configuration and is ``PATH_OUTSIDE_WORKSPACE``, the
+    frozen ``ErrorCode`` the ledger assigns to this failure class.  It inherits
+    :class:`IndexServicePreflightError` so both surfaces report the same
+    unjournaled refusal, and :func:`_code_of` surfaces its code because the code
+    is already in the closed vocabulary.
+    """
+
+    code = PATH_OUTSIDE_WORKSPACE_CODE
 
 
 # ---------------------------------------------------------------------------
@@ -1102,6 +1132,29 @@ def _build_candidate_manifest(
 
     for source in sorted(request.sources, key=lambda item: str(item.request.document_id)):
         document_id = str(source.request.document_id)
+        if text_fingerprint(source.extracted_text) != str(source.request.extracted_content_sha256):
+            # C-11 / E3-NEG-050: the bytes behind this committed path changed
+            # without a re-index request.  The source still claims the committed
+            # content hash, but its text fingerprints to something else, so
+            # indexing it would mint chunk identities bound to bytes that are no
+            # longer there (G-2).  A per-document rejection with the ledger's
+            # code, exactly like the unusable-text rejection below it: the
+            # stale claim is visible with a code (G-7) and never indexed, while
+            # the healthy documents still publish as PARTIAL (RAG-012).
+            rejected.append(
+                {
+                    "code": CHANGED_BYTES_CODE,
+                    "detail": (
+                        "the extracted text does not fingerprint to the committed extracted_content_sha256, "
+                        "so the bytes at this path changed without a re-index request and the document is "
+                        "refused rather than indexed under a stale content claim"
+                    ),
+                    "document_id": document_id,
+                    "extracted_path": source.extracted_path,
+                    "study_id": str(source.request.study_id),
+                }
+            )
+            continue
         chunks = chunker.chunk(
             markdown_text=source.extracted_text,
             base_metadata=source.request.to_base_metadata(),
@@ -1811,7 +1864,7 @@ def require_parent_documents_within_docs_path(
     if not outside:
         return
     positions = ", ".join(str(position) for position, _ in outside)
-    raise IndexServicePreflightError(
+    raise PathOutsideWorkspaceError(
         f"index service refuses docs_path {str(docs_path)!r}: the accepted parent view names "
         f"{len(outside)} document(s) at position(s) {positions} in 'documents' that do not resolve inside "
         f"it. The first of those resolves to {str(outside[0][1])!r}, which is outside that directory. "
@@ -2043,13 +2096,13 @@ def _refuse_path_shaped(value: str, field: str) -> str:
 
     text = str(value)
     if _ABSOLUTE_PATH_PATTERN.match(text):
-        raise IndexServiceValidationError(
+        raise PathOutsideWorkspaceError(
             f"index service refuses {field}: it is an absolute or drive-relative path, and a returned or "
             "persisted reference is workspace-relative by construction (6.6).",
             field=field,
         )
     if _TRAVERSAL_PATTERN.search(text):
-        raise IndexServiceValidationError(
+        raise PathOutsideWorkspaceError(
             f"index service refuses {field}: it contains a '..' segment, so it is not workspace-relative.",
             field=field,
         )
