@@ -1423,8 +1423,14 @@ def test_t90_the_cli_refuses_a_run_with_no_journal_option(tmp_path: Path):
 
     outcome = CliRunner().invoke(app, trimmed)
 
+    # Terminal-robust (T-133d): CI terminals emit ANSI SGR codes around the
+    # option name, splitting the literal. Strip them; the proof is unchanged.
+    plain = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", outcome.output)
+
     assert outcome.exit_code != 0
-    assert "--journal" in outcome.output
+    assert "--journal" in plain, f"missing --journal must be named: {plain!r}"
+    assert "missing option" in plain.lower(), f"missing option must be refused as such: {plain!r}"
+    assert "usage" in plain.lower(), f"refusal must carry usage: {plain!r}"
 
 
 def test_t90_neg_041_the_api_and_the_cli_agree_on_a_success(tmp_path: Path, offline_embedder):
@@ -2362,8 +2368,49 @@ def test_t90_a_ledger_shaped_journal_path_that_leaves_the_workspace_is_still_ref
     assert not (outside / "audit" / "journal.jsonl").exists()
 
 
+def _t133d_fs_is_case_insensitive(directory: Path) -> bool:
+    """Probe whether *directory*'s filesystem folds case (T-133d env hardening).
+
+    Creates ``caseprobe`` and checks whether ``CASEPROBE`` resolves to it, instead
+    of assuming platform == filesystem behaviour. Used only by the Windows
+    case-insensitive ledger test.
+    """
+
+    probe_dir = directory / "_t133d_case_probe"
+    probe_dir.mkdir(exist_ok=True)
+    lower = probe_dir / "caseprobe"
+    upper = probe_dir / "CASEPROBE"
+    try:
+        lower.write_text("x", encoding="utf-8")
+        return upper.exists()
+    finally:
+        try:
+            lower.unlink(missing_ok=True)
+        except OSError:
+            pass
+        try:
+            upper.unlink(missing_ok=True)
+        except OSError:
+            pass
+        try:
+            probe_dir.rmdir()
+        except OSError:
+            pass
+
+
 def test_t90_the_canonical_ledger_refusal_is_case_insensitive_on_windows(tmp_path: Path):
     """The filesystem is case-insensitive here, so the rule must be too."""
+
+    # FS-robust (T-133d): the service folds ledger spelling only when
+    # os.name == "nt". Elsewhere AUDIT/... is a distinct path, so the Windows
+    # refusal cannot be exhibited. Detect the FS honestly; keep Windows coverage.
+    insensitive = _t133d_fs_is_case_insensitive(tmp_path)
+    if os.name != "nt" or not insensitive:
+        pytest.skip(
+            "case-insensitive ledger refusal needs a case-insensitive FS on Windows "
+            f"(os.name={os.name!r}, fs_case_insensitive={insensitive}); "
+            "this platform cannot exhibit the property"
+        )
 
     root = t90_workspace_root(tmp_path)
 
